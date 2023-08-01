@@ -1,0 +1,12 @@
+X(ST0, 80, F)
+X(ST1, 80, F)
+X(ST2, 80, F)
+X(ST3, 80, F)
+X(ST4, 80, F)
+X(ST5, 80, F)
+X(ST6, 80, F)
+X(ST7, 80, F)
+
+X(FPSW, 16, U)
+X(FPCW, 16, U)
+X(FPTW, 16, U)

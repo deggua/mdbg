@@ -1,0 +1,6 @@
+X(CS, 16, U)
+X(SS, 16, U)
+X(DS, 16, U)
+X(ES, 16, U)
+X(FS, 16, U)
+X(GS, 16, U)

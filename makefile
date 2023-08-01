@@ -22,11 +22,14 @@ BIN_DIR = bin
 BUILD_DIR = build
 
 # normal source files
-SRCS = $(SRC_DIR)/main_win32.c
+SRCS = $(SRC_DIR)/main.c
+SRCS += $(SRC_DIR)/tui.c
+SRCS += $(SRC_DIR)/deps/zydis/Zydis.c
 # SRCS += $(wildcard $(SRC_DIR)/common/*.cpp)
 
 # platform source files
-# SRCS += $(wildcard $(SRC_DIR)/platform/windows/*.c)
+SRCS += $(SRC_DIR)/dbg/x86_64/x86_64.c
+SRCS += $(SRC_DIR)/dbg/x86_64/windows.c
 
 DEBUG_OBJS = $(SRCS:src/%.c=$(BUILD_DIR)/debug/%.o)
 DEBUG_DEPS = $(DEBUG_OBJS:%.o=%.d)

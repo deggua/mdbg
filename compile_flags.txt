@@ -8,18 +8,28 @@
 -Wpedantic
 
 -Wno-gnu-zero-variadic-macro-arguments
+-Wno-gnu-statement-expression-from-macro-expansion
 -Wno-gnu-anonymous-struct
+-Wno-gnu-empty-initializer
+-Wno-gnu-empty-struct
+-Wno-gnu-pointer-arith
+
+-Wno-microsoft-include
+-Wno-microsoft-enum-value
+
 -Wno-deprecated-volatile
 -Wno-nested-anon-types
 -Wno-unused-command-line-argument
 -Wno-language-extension-token
 -Wno-c99-designator
--Wno-microsoft-enum-value
 -Wno-shadow
 
 -ladvapi32
+-luser32
+-lpdcurses
 
 -march=native
 -mtune=native
+-include common/config.h
 
 -D_CRT_SECURE_NO_WARNINGS

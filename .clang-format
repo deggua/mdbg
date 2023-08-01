@@ -106,7 +106,7 @@ QualifierAlignment: Left
 #QualifierOrder: ['static', 'const', 'inline', 'volatile', 'type']
 SeparateDefinitionBlocks: Always
 
-SortIncludes: true
+SortIncludes: false
 SortUsingDeclarations: true
 
 SpaceAfterCStyleCast: false

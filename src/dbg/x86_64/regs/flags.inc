@@ -1,0 +1,3 @@
+X(FLAGS, 16, U)
+X(EFLAGS, 32, U)
+X(RFLAGS, 64, U)
