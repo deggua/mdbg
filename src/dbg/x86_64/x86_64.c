@@ -11,8 +11,18 @@ static const char* REGISTER_NAMES[] = {
 #undef X
 };
 
+static const DBG_RegisterType REGISTER_TYPES[] = {
+#define X(_name, _width, _type) [REG_##_name] = DBG_RegisterType_##_type##_width,
+#include "regs/all.inc"
+#undef X
+};
+
 const char* DBG_Register_Name(DBG_Register reg)
 {
+    if (reg < 0 || (size_t)reg >= lengthof(REGISTER_NAMES)) {
+        return NULL;
+    }
+
     return REGISTER_NAMES[reg];
 }
 
@@ -28,4 +38,15 @@ DBG_Register DBG_Register_FromName(const char* name)
             return ii;
         }
     }
+
+    return REG_INVALID;
+}
+
+DBG_RegisterType DBG_Register_Type(DBG_Register reg)
+{
+    if (reg < 0 || (size_t)reg >= lengthof(REGISTER_TYPES)) {
+        return DBG_RegisterType_NULL;
+    }
+
+    return REGISTER_TYPES[reg];
 }

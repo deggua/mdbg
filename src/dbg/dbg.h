@@ -11,6 +11,8 @@
 // TODO: when supporting ARM
 #endif
 
+#define REG_INVALID (-1)
+
 typedef uintptr_t DBG_Address;
 typedef u64       DBG_PID;
 
@@ -37,18 +39,18 @@ typedef struct {
 } DBG_Event;
 
 typedef enum {
-    DBG_RegisterValueType_NULL,
-    DBG_RegisterValueType_U8,
-    DBG_RegisterValueType_U16,
-    DBG_RegisterValueType_U32,
-    DBG_RegisterValueType_U64,
-    DBG_RegisterValueType_U128,
-    DBG_RegisterValueType_U256,
-    DBG_RegisterValueType_U512,
-    DBG_RegisterValueType_F32,
-    DBG_RegisterValueType_F64,
-    DBG_RegisterValueType_F80,
-} DBG_RegisterValueType;
+    DBG_RegisterType_NULL,
+    DBG_RegisterType_U8,
+    DBG_RegisterType_U16,
+    DBG_RegisterType_U32,
+    DBG_RegisterType_U64,
+    DBG_RegisterType_U128,
+    DBG_RegisterType_U256,
+    DBG_RegisterType_U512,
+    DBG_RegisterType_F32,
+    DBG_RegisterType_F64,
+    DBG_RegisterType_F80,
+} DBG_RegisterType;
 
 // rw -> Updated on read, used for writing
 // r  -> Updated on read
@@ -98,7 +100,7 @@ typedef struct {
 } DBG_RegisterValue_F80;
 
 typedef struct {
-    DBG_RegisterValueType type;
+    DBG_RegisterType type;
 
     union {
         DBG_RegisterValue_U8   U8;
@@ -154,7 +156,7 @@ bool DBG_Thread_SetContext(DBG_Thread* thread);
 // Enables the read/write of a thread's registers
 // Getting a register that isn't supported by the host CPU returns 0
 DBG_RegisterValue DBG_Thread_ReadRegister(DBG_Thread* thread, DBG_Register reg);
-void DBG_Thread_WriteRegister(DBG_Thread* thread, DBG_Register reg, DBG_RegisterValue value);
+bool DBG_Thread_WriteRegister(DBG_Thread* thread, DBG_Register reg, DBG_RegisterValue value);
 
 // Manipulate threads
 bool DBG_Thread_Suspend(DBG_Thread* thread);
@@ -162,9 +164,10 @@ bool DBG_Thread_Resume(DBG_Thread* thread);
 bool DBG_Thread_Kill(DBG_Thread* thread);
 
 // Helper functions for interacting with registers
-const char*  DBG_Register_Name(DBG_Register reg);
-DBG_Register DBG_Register_FromName(const char* name);
-bool         DBG_HasCpuFeature(DBG_CpuFeature feature);
+const char*      DBG_Register_Name(DBG_Register reg);
+DBG_Register     DBG_Register_FromName(const char* name);
+DBG_RegisterType DBG_Register_Type(DBG_Register reg);
+bool             DBG_HasCpuFeature(DBG_CpuFeature feature);
 
 // TODO: not sure about these
 #if 0

@@ -320,6 +320,7 @@ TUI_PrintDisassembly(TUI_Window* window, DBG_Process* proc, DBG_Thread* thread, 
 
 struct {
     DBG_Process* proc;
+    DBG_Thread*  cur_thread;
     DBG_Event    e;
 } DBG;
 
@@ -551,8 +552,6 @@ error_BadSize:
 
 static void RefreshTui(const DBG_Event* e)
 {
-    DBG_Thread_GetContext(e->thread);
-
     TUI_Window_Refresh(TUI.c_root);
 
     TUI_PrintRegisters(TUI.gpr, e->thread);
@@ -654,7 +653,9 @@ static CommandResult Command_Continue(const String cmd)
     (void)cmd;
 
     DBG_Process_DebugContinue(&DBG.e);
-    DBG.e = DBG_Process_DebugWait(DBG.proc);
+    DBG.e          = DBG_Process_DebugWait(DBG.proc);
+    DBG.cur_thread = DBG.e.thread;
+    DBG_Thread_GetContext(DBG.cur_thread);
 
     return (CommandResult){
         .output = String(""),
@@ -758,6 +759,83 @@ static CommandResult Command_Clear(const String cmd)
     };
 }
 
+static CommandResult Command_SetRegister(const String cmd)
+{
+    StringList parts = String_Split(cmd, str(" "));
+    if (parts.len != 3) {
+        StringList_Delete(parts);
+        return (CommandResult){
+            .output = String("Expected 'sr $REGNAME $VALUE'\n"),
+            .status = CommandStatus_FAILURE,
+        };
+    }
+
+    String       reg_name = String_ToUpper(parts.str[1]);
+    DBG_Register reg      = DBG_Register_FromName(cstr(reg_name));
+    if (reg == REG_INVALID) {
+        String_Delete(reg_name);
+        StringList_Delete(parts);
+        return (CommandResult){
+            .output = String(""),
+            .status = CommandStatus_FAILURE,
+        };
+    }
+
+    DBG_RegisterType reg_type = DBG_Register_Type(reg);
+    u64              val      = strtoull(cstr(parts.str[2]), NULL, 16);
+
+    String_Delete(reg_name);
+    StringList_Delete(parts);
+
+    DBG_RegisterValue rval = (DBG_RegisterValue){
+        .type = reg_type,
+    };
+
+    switch (reg_type) {
+        case DBG_RegisterType_U8: {
+            rval.U8.rw_val = (u8)val;
+        } break;
+
+        case DBG_RegisterType_U16: {
+            rval.U16.rw_val = (u16)val;
+        } break;
+
+        case DBG_RegisterType_U32: {
+            rval.U32.rw_val = (u32)val;
+        } break;
+
+        case DBG_RegisterType_U64: {
+            rval.U64.rw_val = (u64)val;
+        } break;
+
+        default: {
+            return (CommandResult){
+                .output = String("Unsupported register type\n"),
+                .status = CommandStatus_FAILURE,
+            };
+        } break;
+    }
+
+    if (!DBG_Thread_WriteRegister(DBG.cur_thread, reg, rval)) {
+        return (CommandResult){
+            .output = String("Failed to write register\n"),
+            .status = CommandStatus_FAILURE,
+        };
+    }
+
+    if (!DBG_Thread_SetContext(DBG.cur_thread)) {
+        return (CommandResult){
+            .output = String("Failed to update thread context\n"),
+            .status = CommandStatus_FAILURE,
+        };
+    }
+
+    return (CommandResult){
+        .output = String(""),
+        .status = CommandStatus_SUCCESS,
+    };
+}
+
 typedef enum {
     CommandMatch_PREFIX,
     CommandMatch_EXACT,
@@ -776,6 +854,7 @@ static CommandResult RunCommand(const String cmd)
         {CommandMatch_PREFIX,    str("b "),    Command_SetBreakpoint},
         {CommandMatch_PREFIX,  str("del "), Command_DeleteBreakpoint},
         {CommandMatch_PREFIX,     str("x"),    Command_ExamineMemory},
+        {CommandMatch_PREFIX,  str("set "),      Command_SetRegister},
     };
 
     for (size_t ii = 0; ii < lengthof(cmd_table); ii++) {
@@ -804,8 +883,10 @@ static void LaunchTui(DBG_Process* proc)
 {
     BuildTui();
 
-    DBG.proc = proc;
-    DBG.e    = DBG_Process_DebugWait(proc);
+    DBG.proc       = proc;
+    DBG.e          = DBG_Process_DebugWait(proc);
+    DBG.cur_thread = DBG.e.thread;
+    DBG_Thread_GetContext(DBG.cur_thread);
 
     scrollok(TUI.cmds->content, true);
     RefreshTui(&DBG.e);

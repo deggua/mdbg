@@ -10,6 +10,15 @@
 
 #define MAX_BPS 16
 
+/* clang-format off */
+
+#define LOWMASK(_upper)      (((_upper) >= 64) ? (~0ull) : ((1ull << (_upper)) - 1ull))
+#define MASK(_upper, _lower) (LOWMASK(_upper) & ~LOWMASK(_lower))
+#define EXTRACT(_val, _upper, _lower) (((_val)&MASK((_upper) + 1, (_lower))) >> (_lower))
+#define REPLACE(_val, _upper, _lower, _with)  (((_val) & ~MASK((_upper) + 1, (_lower))) | (((_with) & LOWMASK((_upper) - (_lower) + 1)) << (_lower)))
+
+/* clang-format on */
+
 typedef struct DBG_Thread {
     DWORD    id;
     HANDLE   handle;
@@ -228,7 +237,7 @@ bool DBG_Thread_SetContext(DBG_Thread* thread)
     SetThreadContext(thread->handle, thread->ctx);
 }
 
-static DBG_RegisterValue ExtRegisterFromContext(CONTEXT* ctx, DBG_Register reg)
+static DBG_RegisterValue GetExtraRegisterFromContext(CONTEXT* ctx, DBG_Register reg)
 {
     if (REG_BEGIN_SSE < reg && reg < REG_END_SSE) {
         M128A* xmm = LocateXStateFeature(ctx, XSTATE_LEGACY_SSE, NULL);
@@ -255,25 +264,32 @@ static DBG_RegisterValue ExtRegisterFromContext(CONTEXT* ctx, DBG_Register reg)
     }
     // TODO: AVX512, X87, MMX
 
-    return (DBG_RegisterValue){
-        .type = DBG_RegisterValueType_NULL,
-    };
+    return DBG_RV_NULL();
 }
+
+static bool SetExtraRegisterInContext(CONTEXT* ctx, DBG_Register reg, DBG_RegisterValue value)
+{
+    (void)ctx;
+    (void)reg;
+    (void)value;
+    return true;
+}
+
+// clang-format off
 
 DBG_RegisterValue DBG_Thread_ReadRegister(DBG_Thread* thread, DBG_Register reg)
 {
     CONTEXT* ctx = thread->ctx;
 
-    // clang-format off
     switch (reg) {
         /* flags */
-        case REG_FLAGS:  return DBG_RV_U16(ctx->EFlags & 0xFFFF);
-        case REG_EFLAGS: return DBG_RV_U32(ctx->EFlags & 0xFFFFFFFF);
+        case REG_FLAGS:  return DBG_RV_U16(EXTRACT(ctx->EFlags, 15, 0));
+        case REG_EFLAGS: return DBG_RV_U32(EXTRACT(ctx->EFlags, 31, 0));
         case REG_RFLAGS: return DBG_RV_U64(ctx->EFlags);
 
         /* instruction pointer */
-        case REG_IP:  return DBG_RV_U16(ctx->Rip & 0xFFFF);
-        case REG_EIP: return DBG_RV_U32(ctx->Rip & 0xFFFFFFFFF);
+        case REG_IP:  return DBG_RV_U16(EXTRACT(ctx->Rip, 15, 0));
+        case REG_EIP: return DBG_RV_U32(EXTRACT(ctx->Rip, 31, 0));
         case REG_RIP: return DBG_RV_U64(ctx->Rip);
 
         /* debug registers */
@@ -295,62 +311,63 @@ DBG_RegisterValue DBG_Thread_ReadRegister(DBG_Thread* thread, DBG_Register reg)
         case REG_GS: return DBG_RV_U16(ctx->SegGs);
 
         /* GPRs 8-bit */
-        case REG_AH:   return DBG_RV_U8((ctx->Rax >> 8) & 0xFF);
-        case REG_AL:   return DBG_RV_U8((ctx->Rax >> 0) & 0xFF);
-        case REG_BH:   return DBG_RV_U8((ctx->Rbx >> 8) & 0xFF);
-        case REG_BL:   return DBG_RV_U8((ctx->Rbx >> 0) & 0xFF);
-        case REG_CH:   return DBG_RV_U8((ctx->Rcx >> 8) & 0xFF);
-        case REG_CL:   return DBG_RV_U8((ctx->Rcx >> 0) & 0xFF);
-        case REG_DH:   return DBG_RV_U8((ctx->Rdx >> 8) & 0xFF);
-        case REG_DL:   return DBG_RV_U8((ctx->Rdx >> 0) & 0xFF);
-        case REG_SIL:  return DBG_RV_U8((ctx->Rsi >> 0) & 0xFF);
-        case REG_DIL:  return DBG_RV_U8((ctx->Rdi >> 0) & 0xFF);
-        case REG_BPL:  return DBG_RV_U8((ctx->Rbp >> 0) & 0xFF);
-        case REG_SPL:  return DBG_RV_U8((ctx->Rsp >> 0) & 0xFF);
-        case REG_R8B:  return DBG_RV_U8((ctx->R8  >> 0) & 0xFF);
-        case REG_R9B:  return DBG_RV_U8((ctx->R9  >> 0) & 0xFF);
-        case REG_R10B: return DBG_RV_U8((ctx->R10 >> 0) & 0xFF);
-        case REG_R11B: return DBG_RV_U8((ctx->R11 >> 0) & 0xFF);
-        case REG_R12B: return DBG_RV_U8((ctx->R12 >> 0) & 0xFF);
-        case REG_R13B: return DBG_RV_U8((ctx->R13 >> 0) & 0xFF);
-        case REG_R14B: return DBG_RV_U8((ctx->R14 >> 0) & 0xFF);
-        case REG_R15B: return DBG_RV_U8((ctx->R15 >> 0) & 0xFF);
+        case REG_AL:   return DBG_RV_U8(EXTRACT(ctx->Rax, 7, 0));
+        case REG_BL:   return DBG_RV_U8(EXTRACT(ctx->Rbx, 7, 0));
+        case REG_CL:   return DBG_RV_U8(EXTRACT(ctx->Rcx, 7, 0));
+        case REG_DL:   return DBG_RV_U8(EXTRACT(ctx->Rdx, 7, 0));
+        case REG_SIL:  return DBG_RV_U8(EXTRACT(ctx->Rsi, 7, 0));
+        case REG_DIL:  return DBG_RV_U8(EXTRACT(ctx->Rdi, 7, 0));
+        case REG_BPL:  return DBG_RV_U8(EXTRACT(ctx->Rbp, 7, 0));
+        case REG_SPL:  return DBG_RV_U8(EXTRACT(ctx->Rsp, 7, 0));
+        case REG_R8B:  return DBG_RV_U8(EXTRACT(ctx->R8,  7, 0));
+        case REG_R9B:  return DBG_RV_U8(EXTRACT(ctx->R9,  7, 0));
+        case REG_R10B: return DBG_RV_U8(EXTRACT(ctx->R10, 7, 0));
+        case REG_R11B: return DBG_RV_U8(EXTRACT(ctx->R11, 7, 0));
+        case REG_R12B: return DBG_RV_U8(EXTRACT(ctx->R12, 7, 0));
+        case REG_R13B: return DBG_RV_U8(EXTRACT(ctx->R13, 7, 0));
+        case REG_R14B: return DBG_RV_U8(EXTRACT(ctx->R14, 7, 0));
+        case REG_R15B: return DBG_RV_U8(EXTRACT(ctx->R15, 7, 0));
+
+        case REG_AH:   return DBG_RV_U8(EXTRACT(ctx->Rax, 15, 8));
+        case REG_BH:   return DBG_RV_U8(EXTRACT(ctx->Rbx, 15, 8));
+        case REG_CH:   return DBG_RV_U8(EXTRACT(ctx->Rcx, 15, 8));
+        case REG_DH:   return DBG_RV_U8(EXTRACT(ctx->Rdx, 15, 8));
 
         /* GPRs 16-bit */
-        case REG_AX:   return DBG_RV_U16(ctx->Rax & 0xFFFF);
-        case REG_BX:   return DBG_RV_U16(ctx->Rbx & 0xFFFF);
-        case REG_CX:   return DBG_RV_U16(ctx->Rcx & 0xFFFF);
-        case REG_DX:   return DBG_RV_U16(ctx->Rdx & 0xFFFF);
-        case REG_SI:   return DBG_RV_U16(ctx->Rsi & 0xFFFF);
-        case REG_DI:   return DBG_RV_U16(ctx->Rdi & 0xFFFF);
-        case REG_BP:   return DBG_RV_U16(ctx->Rbp & 0xFFFF);
-        case REG_SP:   return DBG_RV_U16(ctx->Rsp & 0xFFFF);
-        case REG_R8W:  return DBG_RV_U16(ctx->R8  & 0xFFFF);
-        case REG_R9W:  return DBG_RV_U16(ctx->R9  & 0xFFFF);
-        case REG_R10W: return DBG_RV_U16(ctx->R10 & 0xFFFF);
-        case REG_R11W: return DBG_RV_U16(ctx->R11 & 0xFFFF);
-        case REG_R12W: return DBG_RV_U16(ctx->R12 & 0xFFFF);
-        case REG_R13W: return DBG_RV_U16(ctx->R13 & 0xFFFF);
-        case REG_R14W: return DBG_RV_U16(ctx->R14 & 0xFFFF);
-        case REG_R15W: return DBG_RV_U16(ctx->R15 & 0xFFFF);
+        case REG_AX:   return DBG_RV_U16(EXTRACT(ctx->Rax, 15, 0));
+        case REG_BX:   return DBG_RV_U16(EXTRACT(ctx->Rbx, 15, 0));
+        case REG_CX:   return DBG_RV_U16(EXTRACT(ctx->Rcx, 15, 0));
+        case REG_DX:   return DBG_RV_U16(EXTRACT(ctx->Rdx, 15, 0));
+        case REG_SI:   return DBG_RV_U16(EXTRACT(ctx->Rsi, 15, 0));
+        case REG_DI:   return DBG_RV_U16(EXTRACT(ctx->Rdi, 15, 0));
+        case REG_BP:   return DBG_RV_U16(EXTRACT(ctx->Rbp, 15, 0));
+        case REG_SP:   return DBG_RV_U16(EXTRACT(ctx->Rsp, 15, 0));
+        case REG_R8W:  return DBG_RV_U16(EXTRACT(ctx->R8,  15, 0));
+        case REG_R9W:  return DBG_RV_U16(EXTRACT(ctx->R9,  15, 0));
+        case REG_R10W: return DBG_RV_U16(EXTRACT(ctx->R10, 15, 0));
+        case REG_R11W: return DBG_RV_U16(EXTRACT(ctx->R11, 15, 0));
+        case REG_R12W: return DBG_RV_U16(EXTRACT(ctx->R12, 15, 0));
+        case REG_R13W: return DBG_RV_U16(EXTRACT(ctx->R13, 15, 0));
+        case REG_R14W: return DBG_RV_U16(EXTRACT(ctx->R14, 15, 0));
+        case REG_R15W: return DBG_RV_U16(EXTRACT(ctx->R15, 15, 0));
 
         /* GPRs 32-bit */
-        case REG_EAX:  return DBG_RV_U32(ctx->Rax & 0xFFFFFFFF);
-        case REG_EBX:  return DBG_RV_U32(ctx->Rbx & 0xFFFFFFFF);
-        case REG_ECX:  return DBG_RV_U32(ctx->Rcx & 0xFFFFFFFF);
-        case REG_EDX:  return DBG_RV_U32(ctx->Rdx & 0xFFFFFFFF);
-        case REG_ESI:  return DBG_RV_U32(ctx->Rsi & 0xFFFFFFFF);
-        case REG_EDI:  return DBG_RV_U32(ctx->Rdi & 0xFFFFFFFF);
-        case REG_EBP:  return DBG_RV_U32(ctx->Rbp & 0xFFFFFFFF);
-        case REG_ESP:  return DBG_RV_U32(ctx->Rsp & 0xFFFFFFFF);
-        case REG_R8D:  return DBG_RV_U32(ctx->R8  & 0xFFFFFFFF);
-        case REG_R9D:  return DBG_RV_U32(ctx->R9  & 0xFFFFFFFF);
-        case REG_R10D: return DBG_RV_U32(ctx->R10 & 0xFFFFFFFF);
-        case REG_R11D: return DBG_RV_U32(ctx->R11 & 0xFFFFFFFF);
-        case REG_R12D: return DBG_RV_U32(ctx->R12 & 0xFFFFFFFF);
-        case REG_R13D: return DBG_RV_U32(ctx->R13 & 0xFFFFFFFF);
-        case REG_R14D: return DBG_RV_U32(ctx->R14 & 0xFFFFFFFF);
-        case REG_R15D: return DBG_RV_U32(ctx->R15 & 0xFFFFFFFF);
+        case REG_EAX:  return DBG_RV_U32(EXTRACT(ctx->Rax, 31, 0));
+        case REG_EBX:  return DBG_RV_U32(EXTRACT(ctx->Rbx, 31, 0));
+        case REG_ECX:  return DBG_RV_U32(EXTRACT(ctx->Rcx, 31, 0));
+        case REG_EDX:  return DBG_RV_U32(EXTRACT(ctx->Rdx, 31, 0));
+        case REG_ESI:  return DBG_RV_U32(EXTRACT(ctx->Rsi, 31, 0));
+        case REG_EDI:  return DBG_RV_U32(EXTRACT(ctx->Rdi, 31, 0));
+        case REG_EBP:  return DBG_RV_U32(EXTRACT(ctx->Rbp, 31, 0));
+        case REG_ESP:  return DBG_RV_U32(EXTRACT(ctx->Rsp, 31, 0));
+        case REG_R8D:  return DBG_RV_U32(EXTRACT(ctx->R8,  31, 0));
+        case REG_R9D:  return DBG_RV_U32(EXTRACT(ctx->R9,  31, 0));
+        case REG_R10D: return DBG_RV_U32(EXTRACT(ctx->R10, 31, 0));
+        case REG_R11D: return DBG_RV_U32(EXTRACT(ctx->R11, 31, 0));
+        case REG_R12D: return DBG_RV_U32(EXTRACT(ctx->R12, 31, 0));
+        case REG_R13D: return DBG_RV_U32(EXTRACT(ctx->R13, 31, 0));
+        case REG_R14D: return DBG_RV_U32(EXTRACT(ctx->R14, 31, 0));
+        case REG_R15D: return DBG_RV_U32(EXTRACT(ctx->R15, 31, 0));
 
         /* GPRs 64-bit */
         case REG_RAX: return DBG_RV_U64(ctx->Rax);
@@ -370,7 +387,405 @@ DBG_RegisterValue DBG_Thread_ReadRegister(DBG_Thread* thread, DBG_Register reg)
         case REG_R14: return DBG_RV_U64(ctx->R14);
         case REG_R15: return DBG_RV_U64(ctx->R15);
 
-        // clang-format on
+        /* others */
+        default: {
+            if ((REG_BEGIN_X87 < reg && reg < REG_END_X87)
+                || (REG_BEGIN_MMX < reg && reg < REG_END_MMX)
+                || (REG_BEGIN_SSE < reg && reg < REG_END_SSE)
+                || (REG_BEGIN_AVX < reg && reg < REG_END_AVX)
+                || (REG_BEGIN_AVX512_XMM < reg && reg < REG_END_AVX512_XMM)
+                || (REG_BEGIN_AVX512_YMM < reg && reg < REG_END_AVX512_YMM)
+                || (REG_BEGIN_AVX512_ZMM < reg && reg < REG_END_AVX512_ZMM)) {
+                return GetExtraRegisterFromContext(ctx, reg);
+            } else {
+                // must be invalid
+                return DBG_RV_NULL();
+            }
+        } break;
+    }
+}
+
+// clang-format on
+
+bool DBG_Thread_WriteRegister(DBG_Thread* thread, DBG_Register reg, DBG_RegisterValue value)
+{
+    CONTEXT* ctx = thread->ctx;
+
+    // check the value parameter is valid for the register
+    switch (reg) {
+#define X(_name, _width, _type, ...)                        \
+    case REG_##_name: {                                     \
+        if (value.type != DBG_RegisterType_##_type##_width) \
+            return false;                                   \
+    } break;
+#include "regs/all.inc"
+#undef X
+
+        default: {
+            return false;
+        } break;
+    }
+
+    switch (reg) {
+        /* flags */
+        case REG_FLAGS: {
+            ctx->EFlags = REPLACE(ctx->EFlags, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_EFLAGS: {
+            ctx->EFlags = value.U32.rw_val;
+        } break;
+
+        case REG_RFLAGS: {
+            ctx->EFlags = (u32)value.U64.rw_val;
+        } break;
+
+        /* instruction pointer */
+        case REG_IP: {
+            ctx->Rip = REPLACE(ctx->Rip, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_EIP: {
+            ctx->Rip = REPLACE(ctx->Rip, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_RIP: {
+            ctx->Rip = value.U64.rw_val;
+        } break;
+
+        /* debug registers */
+        case REG_DR0: {
+            ctx->Dr0 = value.U64.rw_val;
+        } break;
+
+        case REG_DR1: {
+            ctx->Dr1 = value.U64.rw_val;
+        } break;
+
+        case REG_DR2: {
+            ctx->Dr2 = value.U64.rw_val;
+        } break;
+
+        case REG_DR3: {
+            ctx->Dr3 = value.U64.rw_val;
+        } break;
+
+        case REG_DR4: {
+            ctx->Dr6 = value.U64.rw_val;
+        } break;
+
+        case REG_DR5: {
+            ctx->Dr7 = value.U64.rw_val;
+        } break;
+
+        case REG_DR6: {
+            ctx->Dr6 = value.U64.rw_val;
+        } break;
+
+        case REG_DR7: {
+            ctx->Dr7 = value.U64.rw_val;
+        } break;
+
+        /* segment registers */
+        case REG_CS: {
+            ctx->SegCs = value.U16.rw_val;
+        } break;
+
+        case REG_SS: {
+            ctx->SegSs = value.U16.rw_val;
+        } break;
+
+        case REG_DS: {
+            ctx->SegDs = value.U16.rw_val;
+        } break;
+
+        case REG_ES: {
+            ctx->SegEs = value.U16.rw_val;
+        } break;
+
+        case REG_FS: {
+            ctx->SegFs = value.U16.rw_val;
+        } break;
+
+        case REG_GS: {
+            ctx->SegGs = value.U16.rw_val;
+        } break;
+
+        /* GPRs 8-bit */
+        case REG_AL: {
+            ctx->Rax = REPLACE(ctx->Rax, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_BL: {
+            ctx->Rbx = REPLACE(ctx->Rbx, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_CL: {
+            ctx->Rcx = REPLACE(ctx->Rcx, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_DL: {
+            ctx->Rdx = REPLACE(ctx->Rdx, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_SIL: {
+            ctx->Rsi = REPLACE(ctx->Rsi, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_DIL: {
+            ctx->Rdi = REPLACE(ctx->Rdi, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_BPL: {
+            ctx->Rbp = REPLACE(ctx->Rbp, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_SPL: {
+            ctx->Rsp = REPLACE(ctx->Rsp, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_R8B: {
+            ctx->R8 = REPLACE(ctx->R8, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_R9B: {
+            ctx->R9 = REPLACE(ctx->R9, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_R10B: {
+            ctx->R10 = REPLACE(ctx->R10, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_R11B: {
+            ctx->R11 = REPLACE(ctx->R11, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_R12B: {
+            ctx->R12 = REPLACE(ctx->R12, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_R13B: {
+            ctx->R13 = REPLACE(ctx->R13, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_R14B: {
+            ctx->R14 = REPLACE(ctx->R14, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_R15B: {
+            ctx->R15 = REPLACE(ctx->R15, 7, 0, value.U8.rw_val);
+        } break;
+
+        case REG_AH: {
+            ctx->Rax = REPLACE(ctx->Rax, 15, 8, value.U8.rw_val);
+        } break;
+
+        case REG_BH: {
+            ctx->Rbx = REPLACE(ctx->Rbx, 15, 8, value.U8.rw_val);
+        } break;
+
+        case REG_CH: {
+            ctx->Rcx = REPLACE(ctx->Rcx, 15, 8, value.U8.rw_val);
+        } break;
+
+        case REG_DH: {
+            ctx->Rdx = REPLACE(ctx->Rdx, 15, 8, value.U8.rw_val);
+        } break;
+
+        /* GPRs 16-bit */
+        case REG_AX: {
+            ctx->Rax = REPLACE(ctx->Rax, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_BX: {
+            ctx->Rbx = REPLACE(ctx->Rbx, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_CX: {
+            ctx->Rcx = REPLACE(ctx->Rcx, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_DX: {
+            ctx->Rdx = REPLACE(ctx->Rdx, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_SI: {
+            ctx->Rsi = REPLACE(ctx->Rsi, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_DI: {
+            ctx->Rdi = REPLACE(ctx->Rdi, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_BP: {
+            ctx->Rbp = REPLACE(ctx->Rbp, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_SP: {
+            ctx->Rsp = REPLACE(ctx->Rsp, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_R8W: {
+            ctx->R8 = REPLACE(ctx->R8, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_R9W: {
+            ctx->R9 = REPLACE(ctx->R9, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_R10W: {
+            ctx->R10 = REPLACE(ctx->R10, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_R11W: {
+            ctx->R11 = REPLACE(ctx->R11, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_R12W: {
+            ctx->R12 = REPLACE(ctx->R12, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_R13W: {
+            ctx->R13 = REPLACE(ctx->R13, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_R14W: {
+            ctx->R14 = REPLACE(ctx->R14, 15, 0, value.U16.rw_val);
+        } break;
+
+        case REG_R15W: {
+            ctx->R15 = REPLACE(ctx->R15, 15, 0, value.U16.rw_val);
+        } break;
+
+        /* GPRs 32-bit */
+        case REG_EAX: {
+            ctx->Rax = REPLACE(ctx->Rax, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_EBX: {
+            ctx->Rbx = REPLACE(ctx->Rbx, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_ECX: {
+            ctx->Rcx = REPLACE(ctx->Rcx, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_EDX: {
+            ctx->Rdx = REPLACE(ctx->Rdx, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_ESI: {
+            ctx->Rsi = REPLACE(ctx->Rsi, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_EDI: {
+            ctx->Rdi = REPLACE(ctx->Rdi, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_EBP: {
+            ctx->Rbp = REPLACE(ctx->Rbp, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_ESP: {
+            ctx->Rsp = REPLACE(ctx->Rsp, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_R8D: {
+            ctx->R8 = REPLACE(ctx->R8, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_R9D: {
+            ctx->R9 = REPLACE(ctx->R9, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_R10D: {
+            ctx->R10 = REPLACE(ctx->R10, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_R11D: {
+            ctx->R11 = REPLACE(ctx->R11, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_R12D: {
+            ctx->R12 = REPLACE(ctx->R12, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_R13D: {
+            ctx->R13 = REPLACE(ctx->R13, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_R14D: {
+            ctx->R14 = REPLACE(ctx->R14, 31, 0, value.U32.rw_val);
+        } break;
+
+        case REG_R15D: {
+            ctx->R15 = REPLACE(ctx->R15, 31, 0, value.U32.rw_val);
+        } break;
+
+        /* GPRs 64-bit */
+        case REG_RAX: {
+            ctx->Rax = value.U64.rw_val;
+        } break;
+
+        case REG_RBX: {
+            ctx->Rbx = value.U64.rw_val;
+        } break;
+
+        case REG_RCX: {
+            ctx->Rcx = value.U64.rw_val;
+        } break;
+
+        case REG_RDX: {
+            ctx->Rdx = value.U64.rw_val;
+        } break;
+
+        case REG_RSI: {
+            ctx->Rsi = value.U64.rw_val;
+        } break;
+
+        case REG_RDI: {
+            ctx->Rdi = value.U64.rw_val;
+        } break;
+
+        case REG_RBP: {
+            ctx->Rbp = value.U64.rw_val;
+        } break;
+
+        case REG_RSP: {
+            ctx->Rsp = value.U64.rw_val;
+        } break;
+
+        case REG_R8: {
+            ctx->R8 = value.U64.rw_val;
+        } break;
+
+        case REG_R9: {
+            ctx->R9 = value.U64.rw_val;
+        } break;
+
+        case REG_R10: {
+            ctx->R10 = value.U64.rw_val;
+        } break;
+
+        case REG_R11: {
+            ctx->R11 = value.U64.rw_val;
+        } break;
+
+        case REG_R12: {
+            ctx->R12 = value.U64.rw_val;
+        } break;
+
+        case REG_R13: {
+            ctx->R13 = value.U64.rw_val;
+        } break;
+
+        case REG_R14: {
+            ctx->R14 = value.U64.rw_val;
+        } break;
+
+        case REG_R15: {
+            ctx->R15 = value.U64.rw_val;
+        } break;
 
         /* others */
         default: {
@@ -381,18 +796,15 @@ DBG_RegisterValue DBG_Thread_ReadRegister(DBG_Thread* thread, DBG_Register reg)
                 || (REG_BEGIN_AVX512_XMM < reg && reg < REG_END_AVX512_XMM)
                 || (REG_BEGIN_AVX512_YMM < reg && reg < REG_END_AVX512_YMM)
                 || (REG_BEGIN_AVX512_ZMM < reg && reg < REG_END_AVX512_ZMM)) {
-                return ExtRegisterFromContext(ctx, reg);
+                return SetExtraRegisterInContext(ctx, reg, value);
             } else {
                 // must be invalid
-                return DBG_RV_NULL();
+                return false;
             }
         } break;
     }
-}
 
-void DBG_Thread_WriteRegister(DBG_Thread* thread, DBG_Register reg, DBG_RegisterValue value)
-{
-    // TODO
+    return true;
 }
 
 bool DBG_Process_WriteMemory(DBG_Process* proc, DBG_Address addr, const void* data, size_t len)
@@ -606,8 +1018,8 @@ bool DBG_Process_Kill(DBG_Process* proc)
 // if < 0, the operation failed but was recoverable
 // TODO: this isn't generic for archs where the BP instruction isn't a single byte (e.g. ARM)
 // this is okay for now, currently have separate implementations for OS on different arch
-// kind of a waste of effort, most code will be the same, the unique parts are the BP instruction,
-// registers, and maybe microarch considerations
+// kind of a waste of effort, most code will be the same, the unique parts are the BP
+// instruction, registers, and maybe microarch considerations
 // TODO: resolve this when architectures are separated
 static ssize_t ReplaceInstructionByte(HANDLE proc_handle, LPVOID addr, u8 new_byte)
 {
