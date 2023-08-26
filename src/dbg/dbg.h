@@ -127,6 +127,7 @@ DBG_Process* DBG_Process_AttachPID(DBG_PID pid);
 DBG_Event DBG_Begin(DBG_Process* proc);
 DBG_Event DBG_Continue(DBG_Event event, DBG_Process* proc);
 DBG_Event DBG_StepInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* thread);
+DBG_Event DBG_NextInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* thread);
 
 // Manipulate the debuggable process instance
 bool DBG_Process_Detach(DBG_Process* proc);

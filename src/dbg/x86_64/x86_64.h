@@ -126,3 +126,4 @@ typedef enum {
 
 // int3 instruction encoding
 #define DBG_BREAKPOINT_INSTRUCTION 0xCC
+#define DBG_MAX_INSTRUCTION_LEN    15

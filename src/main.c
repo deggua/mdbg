@@ -251,8 +251,8 @@ static void TUI_PrintDisassembly(TUI_Window* window, DBG_Process* proc, DBG_Thre
     int     cols  = getmaxx(wind);
     u64     r_RIP = DBG_Thread_ReadRegister(thread, DBG_Register_RIP).U64.rw_val;
 
-    uint8_t                      instr_mem[16] = {0};
-    ZydisDisassembledInstruction instr         = {0};
+    uint8_t                      instr_mem[DBG_MAX_INSTRUCTION_LEN] = {0};
+    ZydisDisassembledInstruction instr                              = {0};
 
     // TODO: kind of weird behavior, if we hit int3 then RIP is after it
     // but if we hit a user BP then it's before it
@@ -884,6 +884,18 @@ static CommandResult Command_Help(const String cmd)
     };
 }
 
+static CommandResult Command_NextInstruction(const String cmd)
+{
+    DBG.e               = DBG_NextInstruction(DBG.e, DBG.proc, DBG.selected_thread);
+    DBG.selected_thread = DBG.e.thread;
+    DBG.proc            = DBG.e.process;
+
+    return (CommandResult){
+        .output = String(""),
+        .status = CommandStatus_SUCCESS,
+    };
+}
+
 typedef enum {
     CommandMatch_PREFIX,
     CommandMatch_EXACT,
@@ -901,6 +913,7 @@ static CommandResult RunCommand(const String cmd)
         { CommandMatch_EXACT, str("clear"),            Command_Clear},
         { CommandMatch_EXACT,    str("si"),  Command_StepInstruction},
         { CommandMatch_EXACT,  str("help"),             Command_Help},
+        { CommandMatch_EXACT,    str("ni"),  Command_NextInstruction},
         {CommandMatch_PREFIX,    str("b "),    Command_SetBreakpoint},
         {CommandMatch_PREFIX,  str("del "), Command_DeleteBreakpoint},
         {CommandMatch_PREFIX,     str("x"),    Command_ExamineMemory},
