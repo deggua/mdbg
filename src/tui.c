@@ -10,6 +10,21 @@
 // NOTE: Required to be called before using any TUI_* functions
 void TUI_Initialize(void)
 {
+    HANDLE stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (stdout_handle == NULL || stdout_handle == INVALID_HANDLE_VALUE) {
+        ABORT("Failed to get HANDLE to stdout");
+    }
+
+    DWORD console_mode = 0;
+    if (!GetConsoleMode(stdout_handle, &console_mode)) {
+        ABORT("Failed to get console mode");
+    }
+
+    console_mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    if (!SetConsoleMode(stdout_handle, console_mode)) {
+        ABORT("Failed to enable virtual terminal processing");
+    }
+
     initscr();
     raw();
     noecho();
@@ -24,7 +39,9 @@ void TUI_Initialize(void)
 
 void TUI_SetTerminalTitle(const char* str)
 {
-    SetConsoleTitle(str);
+    puts("\x1B]0;");
+    puts(str);
+    puts("\x1B\\");
 }
 
 // NOTE: doesn't create ncurses structures
@@ -81,6 +98,14 @@ void TUI_Window_Delete(TUI_Window* wind)
     String_Delete(wind->title);
 }
 
+static void DrawBorder(TUI_Window* wind)
+{
+    if (wind->has_border && wind->border) {
+        box(wind->border, 0, 0);
+        mvwaddstr(wind->border, 0, 2, cstr(wind->title));
+    }
+}
+
 // Given a root window, construct the ncurses windows required to implement said hierarchy
 void TUI_Window_Construct(TUI_Window* root, int index, int total, TUI_Split parent_split)
 {
@@ -124,8 +149,7 @@ void TUI_Window_Construct(TUI_Window* root, int index, int total, TUI_Split pare
     if (root->has_border) {
         root->border = derwin(parent, height, width, vert_scale * index, horiz_scale * index);
 
-        box(root->border, 0, 0);
-        mvwprintw(root->border, 0, 2, cstr(root->title));
+        DrawBorder(root);
 
         touchwin(parent);
         wrefresh(root->border);
@@ -150,6 +174,7 @@ void TUI_Window_Construct(TUI_Window* root, int index, int total, TUI_Split pare
 
 void TUI_Window_Build(TUI_Window* root)
 {
+    refresh();
     TUI_Window_Construct(root, 0, 1, TUI_Split_Horizontal);
 }
 
@@ -157,7 +182,17 @@ void TUI_Window_Build(TUI_Window* root)
 // NOTE: After calling this changes to the TUI_Window's properties do not affect their render, to
 // alter a property it is necessary to destroy and construct the hierarchy
 // TODO: This is inefficient if window properties need to change on the fly
-void TUI_Window_Destruct(TUI_Window* root) {}
+void TUI_Window_Destruct(TUI_Window* root)
+{
+    for (size_t ii = 0; ii < root->children.length; ii++) {
+        TUI_Window_Destruct(root->children.at[ii]);
+    }
+
+    delwin(root->content);
+    if (root->has_border) {
+        delwin(root->border);
+    }
+}
 
 void TUI_Window_SetSplit(TUI_Window* wind, TUI_Split split)
 {
@@ -166,7 +201,13 @@ void TUI_Window_SetSplit(TUI_Window* wind, TUI_Split split)
 
 void TUI_Window_Refresh(TUI_Window* wind)
 {
+    if (wind->has_border && wind->parent) {
+        touchwin(wind->parent->content);
+    }
+
     if (wind->has_border) {
+        DrawBorder(wind);
+        wrefresh(wind->border);
         touchwin(wind->border);
     } else if (wind->parent == NULL) {
         touchwin(stdscr);

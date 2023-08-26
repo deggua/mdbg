@@ -69,6 +69,8 @@ typedef int_least64_t i64_min;
 typedef size_t  usize;
 typedef ssize_t isize;
 
+#pragma pack(push, 1)
+
 typedef union {
     f32 f32;
 
@@ -99,8 +101,8 @@ typedef union {
     struct {
         u64 frac    : 63;
         u64 integer : 1;
-        u64 exp     : 15;
-        u64 sign    : 1;
+        u16 exp     : 15;
+        u16 sign    : 1;
     };
 
     struct {
@@ -111,7 +113,10 @@ typedef union {
     u8 u8[sizeof(u64) + sizeof(u16)];
 } f80_ieee754;
 
+#pragma pack(pop)
+
 static_assert_decl(sizeof(f32) == 4);
 static_assert_decl(sizeof(f64) == 8);
 static_assert_decl(sizeof(f32_ieee754) == 4);
 static_assert_decl(sizeof(f64_ieee754) == 8);
+static_assert_decl(sizeof(f80_ieee754) == 10);

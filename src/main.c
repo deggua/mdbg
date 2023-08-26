@@ -120,8 +120,8 @@ static void TUI_PrintRegisters(TUI_Window* window, DBG_Thread* thread)
         0,
         0,
         "%-3s = %016llX\n\n",
-        DBG_Register_Name(REG_RIP),
-        DBG_Thread_ReadRegister(thread, REG_RIP).U64.rw_val);
+        DBG_Register_Name(DBG_Register_RIP),
+        DBG_Thread_ReadRegister(thread, DBG_Register_RIP).U64.rw_val);
 
 #if 0
     int  max_line_len = getmaxx(wind);
@@ -129,7 +129,7 @@ static void TUI_PrintRegisters(TUI_Window* window, DBG_Thread* thread)
 #endif
     char buf[128] = {0};
 
-    for (int ii = REG_RAX; ii <= REG_RSP; ii++) {
+    for (int ii = DBG_Register_RAX; ii <= DBG_Register_RSP; ii++) {
         int chars_out = snprintf(
             buf,
             sizeof(buf),
@@ -138,6 +138,7 @@ static void TUI_PrintRegisters(TUI_Window* window, DBG_Thread* thread)
             DBG_Thread_ReadRegister(thread, ii).U64.rw_val);
 
         waddstr(wind, buf);
+        (void)chars_out;
         // cur_line_len += chars_out;
 
         chars_out = snprintf(
@@ -151,18 +152,18 @@ static void TUI_PrintRegisters(TUI_Window* window, DBG_Thread* thread)
         waddstr(wind, "\n");
     }
 
-    DBG_RegisterValue rv_rflags = DBG_Thread_ReadRegister(thread, REG_RFLAGS);
+    DBG_RegisterValue rv_rflags = DBG_Thread_ReadRegister(thread, DBG_Register_RFLAGS);
     u64               rflags    = rv_rflags.U64.rw_val;
 
-    bool flag_cf  = !!(rflags & FLAG_MASK(FLAG_CF));
-    bool flag_pf  = !!(rflags & FLAG_MASK(FLAG_PF));
-    bool flag_af  = !!(rflags & FLAG_MASK(FLAG_AF));
-    bool flag_zf  = !!(rflags & FLAG_MASK(FLAG_ZF));
-    bool flag_sf  = !!(rflags & FLAG_MASK(FLAG_SF));
-    bool flag_tf  = !!(rflags & FLAG_MASK(FLAG_TF));
-    bool flag_if  = !!(rflags & FLAG_MASK(FLAG_IF));
-    bool flag_df  = !!(rflags & FLAG_MASK(FLAG_DF));
-    bool flag_of  = !!(rflags & FLAG_MASK(FLAG_OF));
+    bool flag_cf  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_CF));
+    bool flag_pf  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_PF));
+    bool flag_af  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_AF));
+    bool flag_zf  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_ZF));
+    bool flag_sf  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_SF));
+    bool flag_tf  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_TF));
+    bool flag_if  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_IF));
+    bool flag_df  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_DF));
+    bool flag_of  = !!(rflags & DBG_FLAG_MASK(DBG_Flag_OF));
     bool flag_any = flag_cf || flag_pf || flag_af || flag_zf || flag_sf || flag_tf || flag_if
                     || flag_df || flag_of;
 
@@ -189,7 +190,7 @@ static void TUI_PrintSseRegisters(TUI_Window* window, DBG_Thread* thread)
     werase(wind);
 
     char buf[128] = {0};
-    for (int ii = REG_XMM0; ii <= REG_XMM15; ii++) {
+    for (int ii = DBG_Register_XMM0; ii <= DBG_Register_XMM15; ii++) {
         DBG_RegisterValue rv = DBG_Thread_ReadRegister(thread, ii);
 
         snprintf(
@@ -209,7 +210,7 @@ static void TUI_PrintAvxRegisters(TUI_Window* window, DBG_Thread* thread)
     werase(wind);
 
     char buf[256] = {0};
-    for (int ii = REG_YMM0; ii <= REG_YMM15; ii++) {
+    for (int ii = DBG_Register_YMM0; ii <= DBG_Register_YMM15; ii++) {
         DBG_RegisterValue rv = DBG_Thread_ReadRegister(thread, ii);
 
         snprintf(
@@ -230,7 +231,7 @@ static void TUI_PrintStack(TUI_Window* window, DBG_Process* proc, DBG_Thread* th
     WINDOW* wind = window->content;
     werase(wind);
 
-    DBG_RegisterValue rv_sp = DBG_Thread_ReadRegister(thread, REG_RSP);
+    DBG_RegisterValue rv_sp = DBG_Thread_ReadRegister(thread, DBG_Register_RSP);
     DBG_Address       sp    = rv_sp.U64.rw_val;
 
     char buf[512]  = {0};
@@ -243,20 +244,19 @@ static void TUI_PrintStack(TUI_Window* window, DBG_Process* proc, DBG_Thread* th
     }
 }
 
-static void
-TUI_PrintDisassembly(TUI_Window* window, DBG_Process* proc, DBG_Thread* thread, bool is_int3)
+static void TUI_PrintDisassembly(TUI_Window* window, DBG_Process* proc, DBG_Thread* thread)
 {
     WINDOW* wind  = window->content;
     int     lines = getmaxy(wind);
     int     cols  = getmaxx(wind);
-    u64     r_RIP = DBG_Thread_ReadRegister(thread, REG_RIP).U64.rw_val;
+    u64     r_RIP = DBG_Thread_ReadRegister(thread, DBG_Register_RIP).U64.rw_val;
 
     uint8_t                      instr_mem[16] = {0};
     ZydisDisassembledInstruction instr         = {0};
 
     // TODO: kind of weird behavior, if we hit int3 then RIP is after it
     // but if we hit a user BP then it's before it
-    u64 addr = is_int3 ? r_RIP - 1 : r_RIP;
+    u64 addr = r_RIP;
     for (int ii = 0; ii < lines; ii++) {
         wmove(wind, ii, 0);
         int line_chars = 0;
@@ -320,7 +320,7 @@ TUI_PrintDisassembly(TUI_Window* window, DBG_Process* proc, DBG_Thread* thread, 
 
 struct {
     DBG_Process* proc;
-    DBG_Thread*  cur_thread;
+    DBG_Thread*  selected_thread;
     DBG_Event    e;
 } DBG;
 
@@ -360,17 +360,17 @@ static void BuildTui(void)
 }
 
 typedef enum {
-    DumpMemory_BYTE  = 'b',
-    DumpMemory_WORD  = 'w',
-    DumpMemory_DWORD = 'd',
-    DumpMemory_QWORD = 'q',
+    DumpMemory_BYTE  = 'b', // u8
+    DumpMemory_WORD  = 'w', // u16
+    DumpMemory_DWORD = 'd', // u32
+    DumpMemory_QWORD = 'q', // u64
 } DumpMemory_ElementSize;
 
 typedef enum {
-    DumpMemory_SIGNED   = 'd',
-    DumpMemory_UNSIGNED = 'u',
-    DumpMemory_HEX      = 'x',
-    DumpMemory_FLOAT    = 'f',
+    DumpMemory_SIGNED   = 'd', // %d
+    DumpMemory_UNSIGNED = 'u', // %u
+    DumpMemory_HEX      = 'x', // %x
+    DumpMemory_FLOAT    = 'f', // %f
 } DumpMemory_Format;
 
 static size_t ElementSizeToBytes(DumpMemory_ElementSize esize)
@@ -566,12 +566,17 @@ static void RefreshTui(const DBG_Event* e)
     TUI_PrintStack(TUI.stack, e->process, e->thread);
     TUI_Window_Refresh(TUI.stack);
 
-    bool hit_int3 = (e->type == DBG_EventType_Breakpoint && e->event_breakpoint.bp == NULL);
-    TUI_PrintDisassembly(TUI.disas, e->process, e->thread, hit_int3);
+    TUI_PrintDisassembly(TUI.disas, e->process, e->thread);
     TUI_Window_Refresh(TUI.disas);
 }
 
-static bool GetCommand(char* buf, size_t len)
+typedef enum {
+    GetCommandStatus_EXEC,    // execute command string
+    GetCommandStatus_CANCEL,  // cancel command
+    GetCommandStatus_REFRESH, // refresh now
+} GetCommandStatus;
+
+static GetCommandStatus GetCommand(char* buf, size_t len)
 {
     size_t pos = 0;
 
@@ -583,14 +588,21 @@ static bool GetCommand(char* buf, size_t len)
     while (true) {
         int input = wgetch(TUI.cmds->content);
 
-        bool is_enter     = (input == '\r');
+        bool is_enter     = (input == '\r');                 // TODO: not portable
         bool is_text      = (0x20 <= input && input < 0x7F); // printable ascii char
         bool is_buf_full  = (pos == len);
         bool is_buf_empty = (pos == 0);
         bool is_backspace
             = (input == KEY_BACKSPACE || input == KEY_DC || input == 0x7F || input == '\b');
-        bool is_ctrl_c = (input == 0x3); // TODO: probably not portable
-        // bool is_resized = (input == KEY_RESIZE); // TODO: doesn't work
+
+        // TODO: these are not portable
+        enum {
+            WINDOWS_CTRL_C = 0x3,
+            WINDOWS_CTRL_R = 0x12,
+        };
+
+        bool is_ctrl_c = (input == WINDOWS_CTRL_C);
+        bool is_ctrl_r = (input == WINDOWS_CTRL_R || input == KEY_RESIZE);
         // TODO: need to handle arrow keys
 
         if (is_enter) {
@@ -598,11 +610,14 @@ static bool GetCommand(char* buf, size_t len)
             waddch(TUI.cmds->content, '\n');
             wattroff(TUI.cmds->content, COLOR_CMD_INPUT);
             wattron(TUI.cmds->content, COLOR_CMD_OUTPUT);
-            return true;
+            return GetCommandStatus_EXEC;
 
         } else if (is_ctrl_c) {
             waddch(TUI.cmds->content, '\n');
-            return false;
+            return GetCommandStatus_CANCEL;
+
+        } else if (is_ctrl_r) {
+            return GetCommandStatus_REFRESH;
 
         } else if (is_backspace && !is_buf_empty) {
             pos -= 1;
@@ -628,9 +643,9 @@ static bool GetCommand(char* buf, size_t len)
 }
 
 typedef enum {
-    CommandStatus_SUCCESS,
-    CommandStatus_FAILURE,
-    CommandStatus_EXIT,
+    CommandStatus_SUCCESS, // command executed successfully
+    CommandStatus_FAILURE, // command failed to be executed
+    CommandStatus_EXIT,    // exit now
 } CommandStatus;
 
 typedef struct {
@@ -652,10 +667,9 @@ static CommandResult Command_Continue(const String cmd)
 {
     (void)cmd;
 
-    DBG_Process_DebugContinue(&DBG.e);
-    DBG.e          = DBG_Process_DebugWait(DBG.proc);
-    DBG.cur_thread = DBG.e.thread;
-    DBG_Thread_GetContext(DBG.cur_thread);
+    DBG.e               = DBG_Continue(DBG.e, DBG.proc);
+    DBG.proc            = DBG.proc;
+    DBG.selected_thread = DBG.e.thread;
 
     return (CommandResult){
         .output = String(""),
@@ -759,13 +773,39 @@ static CommandResult Command_Clear(const String cmd)
     };
 }
 
+static CommandResult Command_StepInstruction(const String cmd)
+{
+    size_t num_instructions = 0;
+    if (String_StartsWith(cmd, str("si "))) {
+        if (String_CScan(cmd, "si %zu", &num_instructions) != 1 || num_instructions == 0) {
+            return (CommandResult){
+                .output = String("Missing arguments, valid forms:\n"
+                                 "  si   -- Step 1 instruction\n"
+                                 "  si N -- Step N instructions (N > 0)\n"),
+                .status = CommandStatus_FAILURE,
+            };
+        }
+    } else if (String_Equal(cmd, str("si"))) {
+        num_instructions = 1;
+    }
+
+    DBG.e               = DBG_StepInstruction(DBG.e, DBG.proc, DBG.selected_thread);
+    DBG.proc            = DBG.e.process;
+    DBG.selected_thread = DBG.e.thread;
+
+    return (CommandResult){
+        .output = String(""),
+        .status = CommandStatus_SUCCESS,
+    };
+}
+
 static CommandResult Command_SetRegister(const String cmd)
 {
     StringList parts = String_Split(cmd, str(" "));
     if (parts.len != 3) {
         StringList_Delete(parts);
         return (CommandResult){
-            .output = String("Expected 'sr $REGNAME $VALUE'\n"),
+            .output = String("Expected 'set $REGNAME $VALUE'\n"),
             .status = CommandStatus_FAILURE,
         };
     }
@@ -776,7 +816,7 @@ static CommandResult Command_SetRegister(const String cmd)
         String_Delete(reg_name);
         StringList_Delete(parts);
         return (CommandResult){
-            .output = String(""),
+            .output = String("Invalid register name\n"),
             .status = CommandStatus_FAILURE,
         };
     }
@@ -816,22 +856,30 @@ static CommandResult Command_SetRegister(const String cmd)
         } break;
     }
 
-    if (!DBG_Thread_WriteRegister(DBG.cur_thread, reg, rval)) {
+    if (!DBG_Thread_WriteRegister(DBG.selected_thread, reg, rval)) {
         return (CommandResult){
             .output = String("Failed to write register\n"),
             .status = CommandStatus_FAILURE,
         };
     }
 
-    if (!DBG_Thread_SetContext(DBG.cur_thread)) {
-        return (CommandResult){
-            .output = String("Failed to update thread context\n"),
-            .status = CommandStatus_FAILURE,
-        };
-    }
-
     return (CommandResult){
         .output = String(""),
+        .status = CommandStatus_SUCCESS,
+    };
+}
+
+static CommandResult Command_Help(const String cmd)
+{
+    return (CommandResult){
+        .output = String("          quit, q -- Quit debugging\n"
+                         "continue, cont, c -- Continue execution\n"
+                         "            clear -- Clear the command window\n"
+                         "        stepi, si -- Step instruction(s)\n"
+                         "         break, b -- Set a breakpoint\n"
+                         "      delete, del -- Delete a breakpoint\n"
+                         "       examine, x -- Examine memory\n"
+                         "              set -- Set a register to a value\n"),
         .status = CommandStatus_SUCCESS,
     };
 }
@@ -851,10 +899,13 @@ static CommandResult RunCommand(const String cmd)
         { CommandMatch_EXACT,     str("q"),             Command_Quit},
         { CommandMatch_EXACT,     str("c"),         Command_Continue},
         { CommandMatch_EXACT, str("clear"),            Command_Clear},
+        { CommandMatch_EXACT,    str("si"),  Command_StepInstruction},
+        { CommandMatch_EXACT,  str("help"),             Command_Help},
         {CommandMatch_PREFIX,    str("b "),    Command_SetBreakpoint},
         {CommandMatch_PREFIX,  str("del "), Command_DeleteBreakpoint},
         {CommandMatch_PREFIX,     str("x"),    Command_ExamineMemory},
         {CommandMatch_PREFIX,  str("set "),      Command_SetRegister},
+        {CommandMatch_PREFIX,   str("si "),  Command_StepInstruction},
     };
 
     for (size_t ii = 0; ii < lengthof(cmd_table); ii++) {
@@ -883,19 +934,27 @@ static void LaunchTui(DBG_Process* proc)
 {
     BuildTui();
 
-    DBG.proc       = proc;
-    DBG.e          = DBG_Process_DebugWait(proc);
-    DBG.cur_thread = DBG.e.thread;
-    DBG_Thread_GetContext(DBG.cur_thread);
+    DBG.proc            = proc;
+    DBG.e               = DBG_Begin(proc);
+    DBG.selected_thread = DBG.e.thread;
 
     scrollok(TUI.cmds->content, true);
     RefreshTui(&DBG.e);
 
     String prev_cmd = String("");
     while (true) {
-        char buf[256] = {0};
-        bool exec     = GetCommand(buf, sizeof(buf));
-        if (!exec) {
+        char             buf[256]   = {0};
+        GetCommandStatus cmd_status = GetCommand(buf, sizeof(buf));
+        if (cmd_status == GetCommandStatus_CANCEL) {
+            continue;
+        } else if (cmd_status == GetCommandStatus_REFRESH) {
+            TUI_Window_Destruct(TUI.c_root);
+            resize_term(0, 0);
+            endwin();
+            TUI_Window_Build(TUI.c_root);
+            scrollok(TUI.cmds->content, true);
+            werase(TUI.c_root->content);
+            RefreshTui(&DBG.e);
             continue;
         }
 

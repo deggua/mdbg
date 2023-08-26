@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include "dbg/dbg.h"
 #include "dbg/dbg_internal.h"
@@ -19,17 +20,18 @@
 
 /* clang-format on */
 
-typedef struct DBG_Thread {
-    DWORD    id;
-    HANDLE   handle;
-    void*    ctx_buffer;
-    CONTEXT* ctx;
-} DBG_Thread;
-
 typedef struct DBG_Process {
     DWORD  id;
     HANDLE handle;
 } DBG_Process;
+
+typedef struct DBG_Thread {
+    DBG_Process* proc;
+    DWORD        id;
+    HANDLE       handle;
+    void*        ctx_buffer;
+    CONTEXT*     ctx;
+} DBG_Thread;
 
 // TODO: HW breakpoints
 typedef struct DBG_Breakpoint {
@@ -46,28 +48,85 @@ static DBG_Breakpoint Breakpoints[MAX_BPS];
 // TODO: Returning DBG_Thread* and DBG_Process* is problematic, we easily leak memory and requiring
 // the API to return these objects is unintuitive, need to think about how to handle this
 
-static DBG_Process* MakeProcess(DWORD id, HANDLE handle)
+static DBG_Process* MakeProcess(DWORD proc_id)
 {
     DBG_Process* proc = malloc(sizeof(*proc));
-    if (proc == NULL) {
-        return NULL;
-    }
+    ASSERT(proc != NULL);
 
-    proc->id     = id;
-    proc->handle = handle;
+    proc->id     = proc_id;
+    proc->handle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, proc_id);
+    ASSERT(proc->handle != NULL);
+
     return proc;
 }
 
-static DBG_Thread* MakeThread(DWORD id, HANDLE* handle)
+static void DeleteProcess(DBG_Process* proc)
+{
+    CloseHandle(proc->handle);
+    free(proc);
+}
+
+static DBG_Thread* MakeThread(DBG_Process* proc, DWORD thread_id)
 {
     DBG_Thread* thread = malloc(sizeof(*thread));
-    if (thread == NULL) {
-        return NULL;
-    }
+    ASSERT(thread != NULL);
 
-    thread->id     = id;
-    thread->handle = handle;
+    thread->proc   = proc;
+    thread->id     = thread_id;
+    thread->handle = OpenThread(THREAD_ALL_ACCESS, FALSE, thread_id);
     return thread;
+}
+
+static void DeleteThread(DBG_Thread* thread)
+{
+    CloseHandle(thread->handle);
+    free(thread);
+}
+
+// TODO: basically we need to do the following
+// 1. Figure out what features are available
+// 2. Setup a CONTEXT to request all the registers for all features
+// 3. Get the CONTEXT with all features
+// 4. Save the pointers/etc to the DBG_Thread object
+// 5. When we actually want to read registers we refer to the cached CONTEXT object
+// 5a. If a feature doesn't exist then we return 0
+// 6. When we actually want to write registers we write to the cached CONTEXT object (might need to
+// 6a. If a feature doesn't exist we return a failure
+// track what registers were modified)
+// 7. When we want to update a thread's context we call SetContext which uses the cached, modified
+// CONTEXT to update the thread's registers
+
+// Figuring out the byte layout for these opaque layouts is confusing, what a terrible API
+// It's also slightly more tricky because we want to support all the sub-registers in x86
+// e.g. writes to EIP modify RIP, etc.
+static void ReadThreadContext(DBG_Thread* thread)
+{
+    // TODO: error handling
+    // see:
+    // https://github.com/x64dbg/TitanEngine/blob/01d0d1854f2b16e60b4efc9f84476c67305d8f7c/TitanEngine/TitanEngine.Debugger.Context.cpp#L966
+
+    DWORD ctx_size = 0;
+    InitializeContext(NULL, CONTEXT_ALL | CONTEXT_XSTATE, NULL, &ctx_size);
+
+    void*    buffer = malloc(ctx_size);
+    CONTEXT* ctx;
+    InitializeContext(buffer, CONTEXT_ALL | CONTEXT_XSTATE, &ctx, &ctx_size);
+
+    SetXStateFeaturesMask(
+        ctx,
+        XSTATE_MASK_LEGACY_FLOATING_POINT | XSTATE_MASK_LEGACY_SSE | XSTATE_MASK_AVX
+            | XSTATE_MASK_AVX512);
+    GetThreadContext(thread->handle, ctx);
+
+    thread->ctx_buffer = buffer;
+    thread->ctx        = ctx;
+}
+
+static void WriteThreadContext(DBG_Thread* thread)
+{
+    // TODO: error handling
+    thread->ctx->ContextFlags |= CONTEXT_ALL | CONTEXT_XSTATE;
+    SetThreadContext(thread->handle, thread->ctx);
 }
 
 static DBG_Breakpoint* LocateActiveBP(DBG_Address bp_addr)
@@ -82,82 +141,242 @@ static DBG_Breakpoint* LocateActiveBP(DBG_Address bp_addr)
     return NULL;
 }
 
-DBG_Event DBG_Process_DebugWait(DBG_Process* proc)
+static DBG_EventType ConvertWindowsEventType(const DEBUG_EVENT* event)
 {
-    while (true) {
-        DEBUG_EVENT e = {0};
-        WaitForDebugEvent(&e, INFINITE);
+    if (event->dwDebugEventCode == EXCEPTION_DEBUG_EVENT
+        && event->u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT) {
+        return DBG_EventType_Breakpoint;
 
-        if (e.dwDebugEventCode == EXCEPTION_DEBUG_EVENT
-            && e.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT) {
-            // TODO: don't leak the thread instance
-            // TODO: error handling
+    } else if (
+        event->dwDebugEventCode == EXCEPTION_DEBUG_EVENT
+        && event->u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        return DBG_EventType_StepInstruction;
 
-            HANDLE* thread = OpenThread(THREAD_ALL_ACCESS, FALSE, e.dwThreadId);
-
-            CONTEXT ctx = {.ContextFlags = CONTEXT_FULL};
-            GetThreadContext(thread, &ctx);
-
-            DBG_Address     bp_addr = ctx.Rip - 1;
-            DBG_Breakpoint* bp      = LocateActiveBP(bp_addr);
-            if (bp != NULL) {
-                // rewind and set singlestep flag so that we can re-enable the breakpoint on
-                // continue
-                ctx.Rip -= 1;
-                ctx.ContextFlags = CONTEXT_FULL;
-                SetThreadContext(thread, &ctx);
-
-                bp->hit_count += 1;
-            }
-
-            return (DBG_Event){
-                .process          = proc,
-                .thread           = MakeThread(e.dwThreadId, thread),
-                .type             = DBG_EventType_Breakpoint,
-                .event_breakpoint = bp,
-            };
-        } else {
-            // TODO: handle other exception types
-            ContinueDebugEvent(e.dwProcessId, e.dwThreadId, DBG_EXCEPTION_NOT_HANDLED);
-        }
+    } else {
+        return DBG_EventType_Unknown;
     }
 }
 
-void DBG_Process_DebugContinue(DBG_Event* e)
+static DBG_Event ConvertWindowsEvent(const DEBUG_EVENT* event)
 {
-    if (e->type == DBG_EventType_Breakpoint && e->event_breakpoint.bp) {
-        DBG_Process_DisableBP(e->process, e->event_breakpoint.bp);
+    DBG_Process* proc   = MakeProcess(event->dwProcessId);
+    DBG_Thread*  thread = MakeThread(proc, event->dwThreadId);
+    ReadThreadContext(thread);
 
-        CONTEXT ctx = {.ContextFlags = CONTEXT_FULL};
-        GetThreadContext(e->thread->handle, &ctx);
+    switch (ConvertWindowsEventType(event)) {
+        case DBG_EventType_Breakpoint: {
+            DBG_RegisterValue rip = DBG_Thread_ReadRegister(thread, DBG_Register_RIP);
 
-        // single step flag so we can re-enable the breakpoint
-        ctx.EFlags |= FLAG_MASK(FLAG_TF);
-        ctx.ContextFlags = CONTEXT_FULL;
-        SetThreadContext(e->thread->handle, &ctx);
+            DBG_Breakpoint* bp = LocateActiveBP(rip.U64.rw_val - 1);
+            if (bp != NULL) {
+                rip.U64.rw_val -= 1;
+                DBG_Thread_WriteRegister(thread, DBG_Register_RIP, rip);
+            }
+
+            return (DBG_Event){
+                .process    = proc,
+                .thread     = thread,
+                .type       = DBG_EventType_Breakpoint,
+                .breakpoint = bp,
+            };
+        } break;
+
+        case DBG_EventType_StepInstruction: {
+            return (DBG_Event){
+                .process    = proc,
+                .thread     = thread,
+                .type       = DBG_EventType_StepInstruction,
+                .breakpoint = NULL,
+            };
+        } break;
+
+        default:
+        case DBG_EventType_Unknown: {
+            return (DBG_Event){
+                .type       = DBG_EventType_Unknown,
+                .process    = proc,
+                .thread     = thread,
+                .breakpoint = NULL,
+            };
+        } break;
+    }
+}
+
+static void ContinueWindowsDebugEvent(const DBG_Event* event)
+{
+    ContinueDebugEvent(event->process->id, event->thread->id, DBG_CONTINUE);
+}
+
+static DBG_Event WaitForWindowsDebugEvent(DBG_EventType types)
+{
+    DEBUG_EVENT event;
+    WaitForDebugEvent(&event, INFINITE);
+    DBG_EventType event_type = ConvertWindowsEventType(&event);
+
+    while (!(types & event_type)) {
+        ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_EXCEPTION_NOT_HANDLED);
+        WaitForDebugEvent(&event, INFINITE);
+        event_type = ConvertWindowsEventType(&event);
     }
 
-    ContinueDebugEvent(e->process->id, e->thread->id, DBG_CONTINUE);
+    return ConvertWindowsEvent(&event);
+}
 
-    if (e->type == DBG_EventType_Breakpoint && e->event_breakpoint.bp) {
-        DEBUG_EVENT e_step = {0};
-        WaitForDebugEvent(&e_step, INFINITE);
+DBG_Event DBG_Begin(DBG_Process* proc)
+{
+    // TODO: find the MSDN page that describes the sequence of events when you attach/start a
+    // debugee
+    // Pretty sure the last event you get is a breakpoint event
+    (void)proc;
+    return WaitForWindowsDebugEvent(DBG_EventType_Breakpoint);
+}
 
-        // TODO: what about back to back breakpoints?
-        if (!(e_step.dwDebugEventCode == EXCEPTION_DEBUG_EVENT
-              && e_step.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP)) {
-            ABORT(
-                "Unexpected debug event raised when expecting single step event.\n"
-                "EventCode = %lu\n"
-                "ExceptionCode = %lu\n",
-                e_step.dwDebugEventCode,
-                e_step.u.Exception.ExceptionRecord.ExceptionCode);
+DBG_Event DBG_Continue(DBG_Event event, DBG_Process* proc)
+{
+    (void)proc;
+    bool previous_user_bp = event.type == DBG_EventType_Breakpoint && event.breakpoint != NULL;
+
+    // if the last event was a user breakpoint, disable the breakpoint, set the trap flag, step
+    // instruction, enable the breakpoint, then continue and wait for an event
+    // otherwise, just continue and wait
+    if (previous_user_bp) {
+        DBG_Process_DisableBP(proc, event.breakpoint);
+
+        DBG_RegisterValue eflags = DBG_Thread_ReadRegister(event.thread, DBG_Register_EFLAGS);
+        eflags.U32.rw_val |= DBG_FLAG_MASK(DBG_Flag_TF);
+        DBG_Thread_WriteRegister(event.thread, DBG_Register_EFLAGS, eflags);
+
+        WriteThreadContext(event.thread);
+        ContinueWindowsDebugEvent(&event);
+
+        // TODO: want to catch page faults, signals, etc
+        // Need some way to catch faults during the step
+        DBG_Event tmp_event = WaitForWindowsDebugEvent(DBG_EventType_StepInstruction);
+        DBG_Process_EnableBP(proc, event.breakpoint);
+
+        ContinueWindowsDebugEvent(&tmp_event);
+        // TODO: want to also catch page faults, signals, etc.
+        return WaitForWindowsDebugEvent(DBG_EventType_Breakpoint);
+
+    } else {
+        WriteThreadContext(event.thread);
+        ContinueWindowsDebugEvent(&event);
+        // TODO: want to also catch page faults, signals, etc
+        return WaitForWindowsDebugEvent(DBG_EventType_Breakpoint);
+    }
+}
+
+// TODO: we actually should return some kind of thread container instead of this
+static void IterateThreads(DWORD proc_id, void (*function)(void* ctx, DWORD thread_id), void* ctx)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, proc_id);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        goto error_CreateSnapshot;
+    }
+
+    THREADENTRY32 iter = {
+        .dwSize = sizeof(iter),
+    };
+
+    if (!Thread32First(snapshot, &iter)) {
+        goto error_FirstThread;
+    }
+
+    do {
+        bool holds_thread_id
+            = iter.dwSize >= offsetof(THREADENTRY32, th32ThreadID) + sizeof(iter.th32ThreadID);
+        bool holds_proc_id = iter.dwSize >= offsetof(THREADENTRY32, th32OwnerProcessID)
+                                                + sizeof(iter.th32OwnerProcessID);
+        ASSERT(holds_thread_id && holds_proc_id);
+
+        if (iter.th32OwnerProcessID == proc_id) {
+            function(ctx, iter.th32ThreadID);
         }
+    } while (Thread32Next(snapshot, &iter));
 
-        DBG_Process_EnableBP(e->process, e->event_breakpoint.bp);
+    CloseHandle(snapshot);
+    return;
 
-        ContinueDebugEvent(e->process->id, e->thread->id, DBG_CONTINUE);
+error_FirstThread:
+    CloseHandle(snapshot);
+error_CreateSnapshot:
+    return;
+}
+
+static void SuspendOtherThreads_Lambda(void* ctx, DWORD thread_id)
+{
+    const DWORD* exempt_thread_id = ctx;
+
+    if (thread_id != *exempt_thread_id) {
+        HANDLE cur_thread = OpenThread(THREAD_ALL_ACCESS, FALSE, thread_id);
+        ASSERT(cur_thread != NULL);
+
+        SuspendThread(cur_thread);
+        CloseHandle(cur_thread);
     }
+}
+
+// TODO: we can't preserve thread states if we do this
+// e.g. user suspends threads intentionally, we have to resume all threads
+// unless we track which threads we suspended vs which threads user suspended
+static void SuspendOtherThreads(DWORD proc_id, DWORD exempt_thread_id)
+{
+    IterateThreads(proc_id, SuspendOtherThreads_Lambda, &exempt_thread_id);
+}
+
+static void ResumeAllThreads_Lambda(void* ctx, DWORD thread_id)
+{
+    (void)ctx;
+
+    HANDLE cur_thread = OpenThread(THREAD_ALL_ACCESS, FALSE, thread_id);
+    ASSERT(cur_thread != NULL);
+
+    ResumeThread(cur_thread);
+    CloseHandle(cur_thread);
+}
+
+static void ResumeAllThreads(DWORD proc_id)
+{
+    IterateThreads(proc_id, ResumeAllThreads_Lambda, NULL);
+}
+
+// TODO: error handling
+// TODO: there's gotta be a simpler way to handle this shit
+DBG_Event DBG_StepInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* thread)
+{
+    bool previous_user_bp = event.type == DBG_EventType_Breakpoint && event.breakpoint != NULL;
+    if (previous_user_bp) {
+        DBG_Process_DisableBP(proc, event.breakpoint);
+    }
+
+    // suspend other threads so only this thread advances
+    SuspendOtherThreads(thread->proc->id, thread->id);
+
+    DBG_RegisterValue eflags = DBG_Thread_ReadRegister(thread, DBG_Register_EFLAGS);
+    eflags.U32.rw_val |= DBG_FLAG_MASK(DBG_Flag_TF);
+    DBG_Thread_WriteRegister(thread, DBG_Register_EFLAGS, eflags);
+
+    WriteThreadContext(thread);
+    ContinueWindowsDebugEvent(&event);
+    // TODO: want to catch page faults, signals, etc.
+    DBG_Event step_event
+        = WaitForWindowsDebugEvent(DBG_EventType_StepInstruction | DBG_EventType_Breakpoint);
+
+    // resume all the threads so they can continue execution
+    // TODO: again, this will break user suspended threads
+    ResumeAllThreads(thread->proc->id);
+
+    if (previous_user_bp) {
+        DBG_Process_EnableBP(proc, event.breakpoint);
+    }
+
+    // need to step again to get past the breakpoint we hit
+    bool hit_user_bp = step_event.type == DBG_EventType_Breakpoint && step_event.breakpoint != NULL;
+    if (hit_user_bp) {
+        return DBG_StepInstruction(step_event, step_event.process, step_event.thread);
+    }
+
+    return step_event;
 }
 
 bool DBG_HasCpuFeature(DBG_CpuFeature feature)
@@ -191,71 +410,25 @@ bool DBG_HasCpuFeature(DBG_CpuFeature feature)
     return false;
 }
 
-// TODO: basically we need to do the following
-// 1. Figure out what features are available
-// 2. Setup a CONTEXT to request all the registers for all features
-// 3. Get the CONTEXT with all features
-// 4. Save the pointers/etc to the DBG_Thread object
-// 5. When we actually want to read registers we refer to the cached CONTEXT object
-// 5a. If a feature doesn't exist then we return 0
-// 6. When we actually want to write registers we write to the cached CONTEXT object (might need to
-// 6a. If a feature doesn't exist we return a failure
-// track what registers were modified)
-// 7. When we want to update a thread's context we call SetContext which uses the cached, modified
-// CONTEXT to update the thread's registers
-
-// Figuring out the byte layout for these opaque layouts is confusing, what a terrible API
-// It's also slightly more tricky because we want to support all the sub-registers in x86
-// e.g. writes to EIP modify RIP, etc.
-bool DBG_Thread_GetContext(DBG_Thread* thread)
-{
-    // TODO: error handling
-    // see:
-    // https://github.com/x64dbg/TitanEngine/blob/01d0d1854f2b16e60b4efc9f84476c67305d8f7c/TitanEngine/TitanEngine.Debugger.Context.cpp#L966
-
-    DWORD ctx_size = 0;
-    InitializeContext(NULL, CONTEXT_ALL | CONTEXT_XSTATE, NULL, &ctx_size);
-
-    void*    buffer = malloc(ctx_size);
-    CONTEXT* ctx;
-    InitializeContext(buffer, CONTEXT_ALL | CONTEXT_XSTATE, &ctx, &ctx_size);
-
-    SetXStateFeaturesMask(
-        ctx,
-        XSTATE_MASK_LEGACY_FLOATING_POINT | XSTATE_MASK_LEGACY_SSE | XSTATE_MASK_AVX
-            | XSTATE_MASK_AVX512);
-    GetThreadContext(thread->handle, ctx);
-
-    thread->ctx_buffer = buffer;
-    thread->ctx        = ctx;
-}
-
-bool DBG_Thread_SetContext(DBG_Thread* thread)
-{
-    // TODO: correct?
-    thread->ctx->ContextFlags |= CONTEXT_ALL | CONTEXT_XSTATE;
-    SetThreadContext(thread->handle, thread->ctx);
-}
-
 static DBG_RegisterValue GetExtraRegisterFromContext(CONTEXT* ctx, DBG_Register reg)
 {
-    if (REG_BEGIN_SSE < reg && reg < REG_END_SSE) {
+    if (DBG_Register_BEGIN_SSE < reg && reg < DBG_Register_END_SSE) {
         M128A* xmm = LocateXStateFeature(ctx, XSTATE_LEGACY_SSE, NULL);
         if (xmm == NULL) {
             return DBG_RV_NULL();
         }
 
-        int index = reg - REG_XMM0;
+        int index = reg - DBG_Register_XMM0;
         return DBG_RV_U128(xmm[index].Low, xmm[index].High);
 
-    } else if (REG_BEGIN_AVX < reg && reg < REG_END_AVX) {
+    } else if (DBG_Register_BEGIN_AVX < reg && reg < DBG_Register_END_AVX) {
         M128A* ymm_upper = LocateXStateFeature(ctx, XSTATE_AVX, NULL);
         M128A* ymm_lower = LocateXStateFeature(ctx, XSTATE_LEGACY_SSE, NULL);
         if (ymm_upper == NULL || ymm_lower == NULL) {
             return DBG_RV_NULL();
         }
 
-        int index = reg - REG_YMM0;
+        int index = reg - DBG_Register_YMM0;
         return DBG_RV_U256(
             ymm_lower[index].Low,
             ymm_lower[index].High,
@@ -283,119 +456,119 @@ DBG_RegisterValue DBG_Thread_ReadRegister(DBG_Thread* thread, DBG_Register reg)
 
     switch (reg) {
         /* flags */
-        case REG_FLAGS:  return DBG_RV_U16(EXTRACT(ctx->EFlags, 15, 0));
-        case REG_EFLAGS: return DBG_RV_U32(EXTRACT(ctx->EFlags, 31, 0));
-        case REG_RFLAGS: return DBG_RV_U64(ctx->EFlags);
+        case DBG_Register_FLAGS:  return DBG_RV_U16(EXTRACT(ctx->EFlags, 15, 0));
+        case DBG_Register_EFLAGS: return DBG_RV_U32(EXTRACT(ctx->EFlags, 31, 0));
+        case DBG_Register_RFLAGS: return DBG_RV_U64(ctx->EFlags);
 
         /* instruction pointer */
-        case REG_IP:  return DBG_RV_U16(EXTRACT(ctx->Rip, 15, 0));
-        case REG_EIP: return DBG_RV_U32(EXTRACT(ctx->Rip, 31, 0));
-        case REG_RIP: return DBG_RV_U64(ctx->Rip);
+        case DBG_Register_IP:  return DBG_RV_U16(EXTRACT(ctx->Rip, 15, 0));
+        case DBG_Register_EIP: return DBG_RV_U32(EXTRACT(ctx->Rip, 31, 0));
+        case DBG_Register_RIP: return DBG_RV_U64(ctx->Rip);
 
         /* debug registers */
-        case REG_DR0: return DBG_RV_U64(ctx->Dr0);
-        case REG_DR1: return DBG_RV_U64(ctx->Dr1);
-        case REG_DR2: return DBG_RV_U64(ctx->Dr2);
-        case REG_DR3: return DBG_RV_U64(ctx->Dr3);
-        case REG_DR4: return DBG_RV_U64(ctx->Dr6);
-        case REG_DR5: return DBG_RV_U64(ctx->Dr7);
-        case REG_DR6: return DBG_RV_U64(ctx->Dr6);
-        case REG_DR7: return DBG_RV_U64(ctx->Dr7);
+        case DBG_Register_DR0: return DBG_RV_U64(ctx->Dr0);
+        case DBG_Register_DR1: return DBG_RV_U64(ctx->Dr1);
+        case DBG_Register_DR2: return DBG_RV_U64(ctx->Dr2);
+        case DBG_Register_DR3: return DBG_RV_U64(ctx->Dr3);
+        case DBG_Register_DR4: return DBG_RV_U64(ctx->Dr6);
+        case DBG_Register_DR5: return DBG_RV_U64(ctx->Dr7);
+        case DBG_Register_DR6: return DBG_RV_U64(ctx->Dr6);
+        case DBG_Register_DR7: return DBG_RV_U64(ctx->Dr7);
 
         /* segment registers */
-        case REG_CS: return DBG_RV_U16(ctx->SegCs);
-        case REG_SS: return DBG_RV_U16(ctx->SegSs);
-        case REG_DS: return DBG_RV_U16(ctx->SegDs);
-        case REG_ES: return DBG_RV_U16(ctx->SegEs);
-        case REG_FS: return DBG_RV_U16(ctx->SegFs);
-        case REG_GS: return DBG_RV_U16(ctx->SegGs);
+        case DBG_Register_CS: return DBG_RV_U16(ctx->SegCs);
+        case DBG_Register_SS: return DBG_RV_U16(ctx->SegSs);
+        case DBG_Register_DS: return DBG_RV_U16(ctx->SegDs);
+        case DBG_Register_ES: return DBG_RV_U16(ctx->SegEs);
+        case DBG_Register_FS: return DBG_RV_U16(ctx->SegFs);
+        case DBG_Register_GS: return DBG_RV_U16(ctx->SegGs);
 
         /* GPRs 8-bit */
-        case REG_AL:   return DBG_RV_U8(EXTRACT(ctx->Rax, 7, 0));
-        case REG_BL:   return DBG_RV_U8(EXTRACT(ctx->Rbx, 7, 0));
-        case REG_CL:   return DBG_RV_U8(EXTRACT(ctx->Rcx, 7, 0));
-        case REG_DL:   return DBG_RV_U8(EXTRACT(ctx->Rdx, 7, 0));
-        case REG_SIL:  return DBG_RV_U8(EXTRACT(ctx->Rsi, 7, 0));
-        case REG_DIL:  return DBG_RV_U8(EXTRACT(ctx->Rdi, 7, 0));
-        case REG_BPL:  return DBG_RV_U8(EXTRACT(ctx->Rbp, 7, 0));
-        case REG_SPL:  return DBG_RV_U8(EXTRACT(ctx->Rsp, 7, 0));
-        case REG_R8B:  return DBG_RV_U8(EXTRACT(ctx->R8,  7, 0));
-        case REG_R9B:  return DBG_RV_U8(EXTRACT(ctx->R9,  7, 0));
-        case REG_R10B: return DBG_RV_U8(EXTRACT(ctx->R10, 7, 0));
-        case REG_R11B: return DBG_RV_U8(EXTRACT(ctx->R11, 7, 0));
-        case REG_R12B: return DBG_RV_U8(EXTRACT(ctx->R12, 7, 0));
-        case REG_R13B: return DBG_RV_U8(EXTRACT(ctx->R13, 7, 0));
-        case REG_R14B: return DBG_RV_U8(EXTRACT(ctx->R14, 7, 0));
-        case REG_R15B: return DBG_RV_U8(EXTRACT(ctx->R15, 7, 0));
+        case DBG_Register_AL:   return DBG_RV_U8(EXTRACT(ctx->Rax, 7, 0));
+        case DBG_Register_BL:   return DBG_RV_U8(EXTRACT(ctx->Rbx, 7, 0));
+        case DBG_Register_CL:   return DBG_RV_U8(EXTRACT(ctx->Rcx, 7, 0));
+        case DBG_Register_DL:   return DBG_RV_U8(EXTRACT(ctx->Rdx, 7, 0));
+        case DBG_Register_SIL:  return DBG_RV_U8(EXTRACT(ctx->Rsi, 7, 0));
+        case DBG_Register_DIL:  return DBG_RV_U8(EXTRACT(ctx->Rdi, 7, 0));
+        case DBG_Register_BPL:  return DBG_RV_U8(EXTRACT(ctx->Rbp, 7, 0));
+        case DBG_Register_SPL:  return DBG_RV_U8(EXTRACT(ctx->Rsp, 7, 0));
+        case DBG_Register_R8B:  return DBG_RV_U8(EXTRACT(ctx->R8,  7, 0));
+        case DBG_Register_R9B:  return DBG_RV_U8(EXTRACT(ctx->R9,  7, 0));
+        case DBG_Register_R10B: return DBG_RV_U8(EXTRACT(ctx->R10, 7, 0));
+        case DBG_Register_R11B: return DBG_RV_U8(EXTRACT(ctx->R11, 7, 0));
+        case DBG_Register_R12B: return DBG_RV_U8(EXTRACT(ctx->R12, 7, 0));
+        case DBG_Register_R13B: return DBG_RV_U8(EXTRACT(ctx->R13, 7, 0));
+        case DBG_Register_R14B: return DBG_RV_U8(EXTRACT(ctx->R14, 7, 0));
+        case DBG_Register_R15B: return DBG_RV_U8(EXTRACT(ctx->R15, 7, 0));
 
-        case REG_AH:   return DBG_RV_U8(EXTRACT(ctx->Rax, 15, 8));
-        case REG_BH:   return DBG_RV_U8(EXTRACT(ctx->Rbx, 15, 8));
-        case REG_CH:   return DBG_RV_U8(EXTRACT(ctx->Rcx, 15, 8));
-        case REG_DH:   return DBG_RV_U8(EXTRACT(ctx->Rdx, 15, 8));
+        case DBG_Register_AH:   return DBG_RV_U8(EXTRACT(ctx->Rax, 15, 8));
+        case DBG_Register_BH:   return DBG_RV_U8(EXTRACT(ctx->Rbx, 15, 8));
+        case DBG_Register_CH:   return DBG_RV_U8(EXTRACT(ctx->Rcx, 15, 8));
+        case DBG_Register_DH:   return DBG_RV_U8(EXTRACT(ctx->Rdx, 15, 8));
 
         /* GPRs 16-bit */
-        case REG_AX:   return DBG_RV_U16(EXTRACT(ctx->Rax, 15, 0));
-        case REG_BX:   return DBG_RV_U16(EXTRACT(ctx->Rbx, 15, 0));
-        case REG_CX:   return DBG_RV_U16(EXTRACT(ctx->Rcx, 15, 0));
-        case REG_DX:   return DBG_RV_U16(EXTRACT(ctx->Rdx, 15, 0));
-        case REG_SI:   return DBG_RV_U16(EXTRACT(ctx->Rsi, 15, 0));
-        case REG_DI:   return DBG_RV_U16(EXTRACT(ctx->Rdi, 15, 0));
-        case REG_BP:   return DBG_RV_U16(EXTRACT(ctx->Rbp, 15, 0));
-        case REG_SP:   return DBG_RV_U16(EXTRACT(ctx->Rsp, 15, 0));
-        case REG_R8W:  return DBG_RV_U16(EXTRACT(ctx->R8,  15, 0));
-        case REG_R9W:  return DBG_RV_U16(EXTRACT(ctx->R9,  15, 0));
-        case REG_R10W: return DBG_RV_U16(EXTRACT(ctx->R10, 15, 0));
-        case REG_R11W: return DBG_RV_U16(EXTRACT(ctx->R11, 15, 0));
-        case REG_R12W: return DBG_RV_U16(EXTRACT(ctx->R12, 15, 0));
-        case REG_R13W: return DBG_RV_U16(EXTRACT(ctx->R13, 15, 0));
-        case REG_R14W: return DBG_RV_U16(EXTRACT(ctx->R14, 15, 0));
-        case REG_R15W: return DBG_RV_U16(EXTRACT(ctx->R15, 15, 0));
+        case DBG_Register_AX:   return DBG_RV_U16(EXTRACT(ctx->Rax, 15, 0));
+        case DBG_Register_BX:   return DBG_RV_U16(EXTRACT(ctx->Rbx, 15, 0));
+        case DBG_Register_CX:   return DBG_RV_U16(EXTRACT(ctx->Rcx, 15, 0));
+        case DBG_Register_DX:   return DBG_RV_U16(EXTRACT(ctx->Rdx, 15, 0));
+        case DBG_Register_SI:   return DBG_RV_U16(EXTRACT(ctx->Rsi, 15, 0));
+        case DBG_Register_DI:   return DBG_RV_U16(EXTRACT(ctx->Rdi, 15, 0));
+        case DBG_Register_BP:   return DBG_RV_U16(EXTRACT(ctx->Rbp, 15, 0));
+        case DBG_Register_SP:   return DBG_RV_U16(EXTRACT(ctx->Rsp, 15, 0));
+        case DBG_Register_R8W:  return DBG_RV_U16(EXTRACT(ctx->R8,  15, 0));
+        case DBG_Register_R9W:  return DBG_RV_U16(EXTRACT(ctx->R9,  15, 0));
+        case DBG_Register_R10W: return DBG_RV_U16(EXTRACT(ctx->R10, 15, 0));
+        case DBG_Register_R11W: return DBG_RV_U16(EXTRACT(ctx->R11, 15, 0));
+        case DBG_Register_R12W: return DBG_RV_U16(EXTRACT(ctx->R12, 15, 0));
+        case DBG_Register_R13W: return DBG_RV_U16(EXTRACT(ctx->R13, 15, 0));
+        case DBG_Register_R14W: return DBG_RV_U16(EXTRACT(ctx->R14, 15, 0));
+        case DBG_Register_R15W: return DBG_RV_U16(EXTRACT(ctx->R15, 15, 0));
 
         /* GPRs 32-bit */
-        case REG_EAX:  return DBG_RV_U32(EXTRACT(ctx->Rax, 31, 0));
-        case REG_EBX:  return DBG_RV_U32(EXTRACT(ctx->Rbx, 31, 0));
-        case REG_ECX:  return DBG_RV_U32(EXTRACT(ctx->Rcx, 31, 0));
-        case REG_EDX:  return DBG_RV_U32(EXTRACT(ctx->Rdx, 31, 0));
-        case REG_ESI:  return DBG_RV_U32(EXTRACT(ctx->Rsi, 31, 0));
-        case REG_EDI:  return DBG_RV_U32(EXTRACT(ctx->Rdi, 31, 0));
-        case REG_EBP:  return DBG_RV_U32(EXTRACT(ctx->Rbp, 31, 0));
-        case REG_ESP:  return DBG_RV_U32(EXTRACT(ctx->Rsp, 31, 0));
-        case REG_R8D:  return DBG_RV_U32(EXTRACT(ctx->R8,  31, 0));
-        case REG_R9D:  return DBG_RV_U32(EXTRACT(ctx->R9,  31, 0));
-        case REG_R10D: return DBG_RV_U32(EXTRACT(ctx->R10, 31, 0));
-        case REG_R11D: return DBG_RV_U32(EXTRACT(ctx->R11, 31, 0));
-        case REG_R12D: return DBG_RV_U32(EXTRACT(ctx->R12, 31, 0));
-        case REG_R13D: return DBG_RV_U32(EXTRACT(ctx->R13, 31, 0));
-        case REG_R14D: return DBG_RV_U32(EXTRACT(ctx->R14, 31, 0));
-        case REG_R15D: return DBG_RV_U32(EXTRACT(ctx->R15, 31, 0));
+        case DBG_Register_EAX:  return DBG_RV_U32(EXTRACT(ctx->Rax, 31, 0));
+        case DBG_Register_EBX:  return DBG_RV_U32(EXTRACT(ctx->Rbx, 31, 0));
+        case DBG_Register_ECX:  return DBG_RV_U32(EXTRACT(ctx->Rcx, 31, 0));
+        case DBG_Register_EDX:  return DBG_RV_U32(EXTRACT(ctx->Rdx, 31, 0));
+        case DBG_Register_ESI:  return DBG_RV_U32(EXTRACT(ctx->Rsi, 31, 0));
+        case DBG_Register_EDI:  return DBG_RV_U32(EXTRACT(ctx->Rdi, 31, 0));
+        case DBG_Register_EBP:  return DBG_RV_U32(EXTRACT(ctx->Rbp, 31, 0));
+        case DBG_Register_ESP:  return DBG_RV_U32(EXTRACT(ctx->Rsp, 31, 0));
+        case DBG_Register_R8D:  return DBG_RV_U32(EXTRACT(ctx->R8,  31, 0));
+        case DBG_Register_R9D:  return DBG_RV_U32(EXTRACT(ctx->R9,  31, 0));
+        case DBG_Register_R10D: return DBG_RV_U32(EXTRACT(ctx->R10, 31, 0));
+        case DBG_Register_R11D: return DBG_RV_U32(EXTRACT(ctx->R11, 31, 0));
+        case DBG_Register_R12D: return DBG_RV_U32(EXTRACT(ctx->R12, 31, 0));
+        case DBG_Register_R13D: return DBG_RV_U32(EXTRACT(ctx->R13, 31, 0));
+        case DBG_Register_R14D: return DBG_RV_U32(EXTRACT(ctx->R14, 31, 0));
+        case DBG_Register_R15D: return DBG_RV_U32(EXTRACT(ctx->R15, 31, 0));
 
         /* GPRs 64-bit */
-        case REG_RAX: return DBG_RV_U64(ctx->Rax);
-        case REG_RBX: return DBG_RV_U64(ctx->Rbx);
-        case REG_RCX: return DBG_RV_U64(ctx->Rcx);
-        case REG_RDX: return DBG_RV_U64(ctx->Rdx);
-        case REG_RSI: return DBG_RV_U64(ctx->Rsi);
-        case REG_RDI: return DBG_RV_U64(ctx->Rdi);
-        case REG_RBP: return DBG_RV_U64(ctx->Rbp);
-        case REG_RSP: return DBG_RV_U64(ctx->Rsp);
-        case REG_R8:  return DBG_RV_U64(ctx->R8 );
-        case REG_R9:  return DBG_RV_U64(ctx->R9 );
-        case REG_R10: return DBG_RV_U64(ctx->R10);
-        case REG_R11: return DBG_RV_U64(ctx->R11);
-        case REG_R12: return DBG_RV_U64(ctx->R12);
-        case REG_R13: return DBG_RV_U64(ctx->R13);
-        case REG_R14: return DBG_RV_U64(ctx->R14);
-        case REG_R15: return DBG_RV_U64(ctx->R15);
+        case DBG_Register_RAX: return DBG_RV_U64(ctx->Rax);
+        case DBG_Register_RBX: return DBG_RV_U64(ctx->Rbx);
+        case DBG_Register_RCX: return DBG_RV_U64(ctx->Rcx);
+        case DBG_Register_RDX: return DBG_RV_U64(ctx->Rdx);
+        case DBG_Register_RSI: return DBG_RV_U64(ctx->Rsi);
+        case DBG_Register_RDI: return DBG_RV_U64(ctx->Rdi);
+        case DBG_Register_RBP: return DBG_RV_U64(ctx->Rbp);
+        case DBG_Register_RSP: return DBG_RV_U64(ctx->Rsp);
+        case DBG_Register_R8:  return DBG_RV_U64(ctx->R8 );
+        case DBG_Register_R9:  return DBG_RV_U64(ctx->R9 );
+        case DBG_Register_R10: return DBG_RV_U64(ctx->R10);
+        case DBG_Register_R11: return DBG_RV_U64(ctx->R11);
+        case DBG_Register_R12: return DBG_RV_U64(ctx->R12);
+        case DBG_Register_R13: return DBG_RV_U64(ctx->R13);
+        case DBG_Register_R14: return DBG_RV_U64(ctx->R14);
+        case DBG_Register_R15: return DBG_RV_U64(ctx->R15);
 
         /* others */
         default: {
-            if ((REG_BEGIN_X87 < reg && reg < REG_END_X87)
-                || (REG_BEGIN_MMX < reg && reg < REG_END_MMX)
-                || (REG_BEGIN_SSE < reg && reg < REG_END_SSE)
-                || (REG_BEGIN_AVX < reg && reg < REG_END_AVX)
-                || (REG_BEGIN_AVX512_XMM < reg && reg < REG_END_AVX512_XMM)
-                || (REG_BEGIN_AVX512_YMM < reg && reg < REG_END_AVX512_YMM)
-                || (REG_BEGIN_AVX512_ZMM < reg && reg < REG_END_AVX512_ZMM)) {
+            if ((DBG_Register_BEGIN_X87 < reg && reg < DBG_Register_END_X87)
+                || (DBG_Register_BEGIN_MMX < reg && reg < DBG_Register_END_MMX)
+                || (DBG_Register_BEGIN_SSE < reg && reg < DBG_Register_END_SSE)
+                || (DBG_Register_BEGIN_AVX < reg && reg < DBG_Register_END_AVX)
+                || (DBG_Register_BEGIN_AVX512_XMM < reg && reg < DBG_Register_END_AVX512_XMM)
+                || (DBG_Register_BEGIN_AVX512_YMM < reg && reg < DBG_Register_END_AVX512_YMM)
+                || (DBG_Register_BEGIN_AVX512_ZMM < reg && reg < DBG_Register_END_AVX512_ZMM)) {
                 return GetExtraRegisterFromContext(ctx, reg);
             } else {
                 // must be invalid
@@ -414,7 +587,7 @@ bool DBG_Thread_WriteRegister(DBG_Thread* thread, DBG_Register reg, DBG_Register
     // check the value parameter is valid for the register
     switch (reg) {
 #define X(_name, _width, _type, ...)                        \
-    case REG_##_name: {                                     \
+    case DBG_Register_##_name: {                            \
         if (value.type != DBG_RegisterType_##_type##_width) \
             return false;                                   \
     } break;
@@ -428,374 +601,374 @@ bool DBG_Thread_WriteRegister(DBG_Thread* thread, DBG_Register reg, DBG_Register
 
     switch (reg) {
         /* flags */
-        case REG_FLAGS: {
+        case DBG_Register_FLAGS: {
             ctx->EFlags = REPLACE(ctx->EFlags, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_EFLAGS: {
+        case DBG_Register_EFLAGS: {
             ctx->EFlags = value.U32.rw_val;
         } break;
 
-        case REG_RFLAGS: {
+        case DBG_Register_RFLAGS: {
             ctx->EFlags = (u32)value.U64.rw_val;
         } break;
 
         /* instruction pointer */
-        case REG_IP: {
+        case DBG_Register_IP: {
             ctx->Rip = REPLACE(ctx->Rip, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_EIP: {
+        case DBG_Register_EIP: {
             ctx->Rip = REPLACE(ctx->Rip, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_RIP: {
+        case DBG_Register_RIP: {
             ctx->Rip = value.U64.rw_val;
         } break;
 
         /* debug registers */
-        case REG_DR0: {
+        case DBG_Register_DR0: {
             ctx->Dr0 = value.U64.rw_val;
         } break;
 
-        case REG_DR1: {
+        case DBG_Register_DR1: {
             ctx->Dr1 = value.U64.rw_val;
         } break;
 
-        case REG_DR2: {
+        case DBG_Register_DR2: {
             ctx->Dr2 = value.U64.rw_val;
         } break;
 
-        case REG_DR3: {
+        case DBG_Register_DR3: {
             ctx->Dr3 = value.U64.rw_val;
         } break;
 
-        case REG_DR4: {
+        case DBG_Register_DR4: {
             ctx->Dr6 = value.U64.rw_val;
         } break;
 
-        case REG_DR5: {
+        case DBG_Register_DR5: {
             ctx->Dr7 = value.U64.rw_val;
         } break;
 
-        case REG_DR6: {
+        case DBG_Register_DR6: {
             ctx->Dr6 = value.U64.rw_val;
         } break;
 
-        case REG_DR7: {
+        case DBG_Register_DR7: {
             ctx->Dr7 = value.U64.rw_val;
         } break;
 
         /* segment registers */
-        case REG_CS: {
+        case DBG_Register_CS: {
             ctx->SegCs = value.U16.rw_val;
         } break;
 
-        case REG_SS: {
+        case DBG_Register_SS: {
             ctx->SegSs = value.U16.rw_val;
         } break;
 
-        case REG_DS: {
+        case DBG_Register_DS: {
             ctx->SegDs = value.U16.rw_val;
         } break;
 
-        case REG_ES: {
+        case DBG_Register_ES: {
             ctx->SegEs = value.U16.rw_val;
         } break;
 
-        case REG_FS: {
+        case DBG_Register_FS: {
             ctx->SegFs = value.U16.rw_val;
         } break;
 
-        case REG_GS: {
+        case DBG_Register_GS: {
             ctx->SegGs = value.U16.rw_val;
         } break;
 
         /* GPRs 8-bit */
-        case REG_AL: {
+        case DBG_Register_AL: {
             ctx->Rax = REPLACE(ctx->Rax, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_BL: {
+        case DBG_Register_BL: {
             ctx->Rbx = REPLACE(ctx->Rbx, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_CL: {
+        case DBG_Register_CL: {
             ctx->Rcx = REPLACE(ctx->Rcx, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_DL: {
+        case DBG_Register_DL: {
             ctx->Rdx = REPLACE(ctx->Rdx, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_SIL: {
+        case DBG_Register_SIL: {
             ctx->Rsi = REPLACE(ctx->Rsi, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_DIL: {
+        case DBG_Register_DIL: {
             ctx->Rdi = REPLACE(ctx->Rdi, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_BPL: {
+        case DBG_Register_BPL: {
             ctx->Rbp = REPLACE(ctx->Rbp, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_SPL: {
+        case DBG_Register_SPL: {
             ctx->Rsp = REPLACE(ctx->Rsp, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_R8B: {
+        case DBG_Register_R8B: {
             ctx->R8 = REPLACE(ctx->R8, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_R9B: {
+        case DBG_Register_R9B: {
             ctx->R9 = REPLACE(ctx->R9, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_R10B: {
+        case DBG_Register_R10B: {
             ctx->R10 = REPLACE(ctx->R10, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_R11B: {
+        case DBG_Register_R11B: {
             ctx->R11 = REPLACE(ctx->R11, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_R12B: {
+        case DBG_Register_R12B: {
             ctx->R12 = REPLACE(ctx->R12, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_R13B: {
+        case DBG_Register_R13B: {
             ctx->R13 = REPLACE(ctx->R13, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_R14B: {
+        case DBG_Register_R14B: {
             ctx->R14 = REPLACE(ctx->R14, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_R15B: {
+        case DBG_Register_R15B: {
             ctx->R15 = REPLACE(ctx->R15, 7, 0, value.U8.rw_val);
         } break;
 
-        case REG_AH: {
+        case DBG_Register_AH: {
             ctx->Rax = REPLACE(ctx->Rax, 15, 8, value.U8.rw_val);
         } break;
 
-        case REG_BH: {
+        case DBG_Register_BH: {
             ctx->Rbx = REPLACE(ctx->Rbx, 15, 8, value.U8.rw_val);
         } break;
 
-        case REG_CH: {
+        case DBG_Register_CH: {
             ctx->Rcx = REPLACE(ctx->Rcx, 15, 8, value.U8.rw_val);
         } break;
 
-        case REG_DH: {
+        case DBG_Register_DH: {
             ctx->Rdx = REPLACE(ctx->Rdx, 15, 8, value.U8.rw_val);
         } break;
 
         /* GPRs 16-bit */
-        case REG_AX: {
+        case DBG_Register_AX: {
             ctx->Rax = REPLACE(ctx->Rax, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_BX: {
+        case DBG_Register_BX: {
             ctx->Rbx = REPLACE(ctx->Rbx, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_CX: {
+        case DBG_Register_CX: {
             ctx->Rcx = REPLACE(ctx->Rcx, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_DX: {
+        case DBG_Register_DX: {
             ctx->Rdx = REPLACE(ctx->Rdx, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_SI: {
+        case DBG_Register_SI: {
             ctx->Rsi = REPLACE(ctx->Rsi, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_DI: {
+        case DBG_Register_DI: {
             ctx->Rdi = REPLACE(ctx->Rdi, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_BP: {
+        case DBG_Register_BP: {
             ctx->Rbp = REPLACE(ctx->Rbp, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_SP: {
+        case DBG_Register_SP: {
             ctx->Rsp = REPLACE(ctx->Rsp, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_R8W: {
+        case DBG_Register_R8W: {
             ctx->R8 = REPLACE(ctx->R8, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_R9W: {
+        case DBG_Register_R9W: {
             ctx->R9 = REPLACE(ctx->R9, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_R10W: {
+        case DBG_Register_R10W: {
             ctx->R10 = REPLACE(ctx->R10, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_R11W: {
+        case DBG_Register_R11W: {
             ctx->R11 = REPLACE(ctx->R11, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_R12W: {
+        case DBG_Register_R12W: {
             ctx->R12 = REPLACE(ctx->R12, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_R13W: {
+        case DBG_Register_R13W: {
             ctx->R13 = REPLACE(ctx->R13, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_R14W: {
+        case DBG_Register_R14W: {
             ctx->R14 = REPLACE(ctx->R14, 15, 0, value.U16.rw_val);
         } break;
 
-        case REG_R15W: {
+        case DBG_Register_R15W: {
             ctx->R15 = REPLACE(ctx->R15, 15, 0, value.U16.rw_val);
         } break;
 
         /* GPRs 32-bit */
-        case REG_EAX: {
+        case DBG_Register_EAX: {
             ctx->Rax = REPLACE(ctx->Rax, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_EBX: {
+        case DBG_Register_EBX: {
             ctx->Rbx = REPLACE(ctx->Rbx, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_ECX: {
+        case DBG_Register_ECX: {
             ctx->Rcx = REPLACE(ctx->Rcx, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_EDX: {
+        case DBG_Register_EDX: {
             ctx->Rdx = REPLACE(ctx->Rdx, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_ESI: {
+        case DBG_Register_ESI: {
             ctx->Rsi = REPLACE(ctx->Rsi, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_EDI: {
+        case DBG_Register_EDI: {
             ctx->Rdi = REPLACE(ctx->Rdi, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_EBP: {
+        case DBG_Register_EBP: {
             ctx->Rbp = REPLACE(ctx->Rbp, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_ESP: {
+        case DBG_Register_ESP: {
             ctx->Rsp = REPLACE(ctx->Rsp, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_R8D: {
+        case DBG_Register_R8D: {
             ctx->R8 = REPLACE(ctx->R8, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_R9D: {
+        case DBG_Register_R9D: {
             ctx->R9 = REPLACE(ctx->R9, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_R10D: {
+        case DBG_Register_R10D: {
             ctx->R10 = REPLACE(ctx->R10, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_R11D: {
+        case DBG_Register_R11D: {
             ctx->R11 = REPLACE(ctx->R11, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_R12D: {
+        case DBG_Register_R12D: {
             ctx->R12 = REPLACE(ctx->R12, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_R13D: {
+        case DBG_Register_R13D: {
             ctx->R13 = REPLACE(ctx->R13, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_R14D: {
+        case DBG_Register_R14D: {
             ctx->R14 = REPLACE(ctx->R14, 31, 0, value.U32.rw_val);
         } break;
 
-        case REG_R15D: {
+        case DBG_Register_R15D: {
             ctx->R15 = REPLACE(ctx->R15, 31, 0, value.U32.rw_val);
         } break;
 
         /* GPRs 64-bit */
-        case REG_RAX: {
+        case DBG_Register_RAX: {
             ctx->Rax = value.U64.rw_val;
         } break;
 
-        case REG_RBX: {
+        case DBG_Register_RBX: {
             ctx->Rbx = value.U64.rw_val;
         } break;
 
-        case REG_RCX: {
+        case DBG_Register_RCX: {
             ctx->Rcx = value.U64.rw_val;
         } break;
 
-        case REG_RDX: {
+        case DBG_Register_RDX: {
             ctx->Rdx = value.U64.rw_val;
         } break;
 
-        case REG_RSI: {
+        case DBG_Register_RSI: {
             ctx->Rsi = value.U64.rw_val;
         } break;
 
-        case REG_RDI: {
+        case DBG_Register_RDI: {
             ctx->Rdi = value.U64.rw_val;
         } break;
 
-        case REG_RBP: {
+        case DBG_Register_RBP: {
             ctx->Rbp = value.U64.rw_val;
         } break;
 
-        case REG_RSP: {
+        case DBG_Register_RSP: {
             ctx->Rsp = value.U64.rw_val;
         } break;
 
-        case REG_R8: {
+        case DBG_Register_R8: {
             ctx->R8 = value.U64.rw_val;
         } break;
 
-        case REG_R9: {
+        case DBG_Register_R9: {
             ctx->R9 = value.U64.rw_val;
         } break;
 
-        case REG_R10: {
+        case DBG_Register_R10: {
             ctx->R10 = value.U64.rw_val;
         } break;
 
-        case REG_R11: {
+        case DBG_Register_R11: {
             ctx->R11 = value.U64.rw_val;
         } break;
 
-        case REG_R12: {
+        case DBG_Register_R12: {
             ctx->R12 = value.U64.rw_val;
         } break;
 
-        case REG_R13: {
+        case DBG_Register_R13: {
             ctx->R13 = value.U64.rw_val;
         } break;
 
-        case REG_R14: {
+        case DBG_Register_R14: {
             ctx->R14 = value.U64.rw_val;
         } break;
 
-        case REG_R15: {
+        case DBG_Register_R15: {
             ctx->R15 = value.U64.rw_val;
         } break;
 
         /* others */
         default: {
-            if ((REG_BEGIN_X87 < reg && reg < REG_END_X87)
-                || (REG_BEGIN_MMX < reg && reg < REG_END_MMX)
-                || (REG_BEGIN_SSE < reg && reg < REG_END_SSE)
-                || (REG_BEGIN_AVX < reg && reg < REG_END_AVX)
-                || (REG_BEGIN_AVX512_XMM < reg && reg < REG_END_AVX512_XMM)
-                || (REG_BEGIN_AVX512_YMM < reg && reg < REG_END_AVX512_YMM)
-                || (REG_BEGIN_AVX512_ZMM < reg && reg < REG_END_AVX512_ZMM)) {
+            if ((DBG_Register_BEGIN_X87 < reg && reg < DBG_Register_END_X87)
+                || (DBG_Register_BEGIN_MMX < reg && reg < DBG_Register_END_MMX)
+                || (DBG_Register_BEGIN_SSE < reg && reg < DBG_Register_END_SSE)
+                || (DBG_Register_BEGIN_AVX < reg && reg < DBG_Register_END_AVX)
+                || (DBG_Register_BEGIN_AVX512_XMM < reg && reg < DBG_Register_END_AVX512_XMM)
+                || (DBG_Register_BEGIN_AVX512_YMM < reg && reg < DBG_Register_END_AVX512_YMM)
+                || (DBG_Register_BEGIN_AVX512_ZMM < reg && reg < DBG_Register_END_AVX512_ZMM)) {
                 return SetExtraRegisterInContext(ctx, reg, value);
             } else {
                 // must be invalid
@@ -875,21 +1048,19 @@ bool DBG_Process_ReadMemory(DBG_Process* proc, DBG_Address addr, void* data, siz
 // all threads) since other shit would be broken, but I'm not sure
 bool DBG_Thread_Suspend(DBG_Thread* thread)
 {
-    if (SuspendThread(thread->handle) == (DWORD)-1) {
-        return false;
-    }
+    return SuspendThread(thread->handle) != (DWORD)-1;
 }
 
 bool DBG_Thread_Resume(DBG_Thread* thread)
 {
-    ResumeThread(thread->handle);
+    return ResumeThread(thread->handle) != (DWORD)-1;
 }
 
 bool DBG_Thread_Kill(DBG_Thread* thread)
 {
     // TODO: do we even want this functionality?
     // TODO: what exit code?
-    TerminateThread(thread->handle, 0);
+    return TerminateThread(thread->handle, 0) != 0;
 }
 
 DBG_Process* DBG_Process_AttachNew(const char* exe, const char* args, const char* workdir)
@@ -991,13 +1162,8 @@ bool DBG_Process_Resume(DBG_Process* proc)
     // is an a breakpoint exception, therefore waiting for a breakpoint event
     // and continuing resumes the process
 
-    DBG_Event e = {0};
-
-    do {
-        e = DBG_Process_DebugWait(proc);
-        DBG_Process_DebugContinue(&e);
-    } while (e.type != DBG_EventType_Breakpoint);
-
+    (void)proc;
+    WaitForWindowsDebugEvent(DBG_EventType_Breakpoint);
     return true;
 }
 

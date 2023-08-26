@@ -21,8 +21,9 @@ typedef struct DBG_Process    DBG_Process;
 typedef struct DBG_Breakpoint DBG_Breakpoint;
 
 typedef enum {
-    DBG_EventType_Breakpoint,
-    // TODO: others
+    DBG_EventType_Unknown         = 0,
+    DBG_EventType_Breakpoint      = (1 << 0), // Indicates the process hit a breakpoint
+    DBG_EventType_StepInstruction = (1 << 1), // Indicates an instruction was stepped
 } DBG_EventType;
 
 typedef struct {
@@ -31,11 +32,7 @@ typedef struct {
 
     DBG_EventType type;
 
-    union {
-        struct {
-            DBG_Breakpoint* bp;
-        } event_breakpoint;
-    };
+    DBG_Breakpoint* breakpoint;
 } DBG_Event;
 
 typedef enum {
@@ -127,8 +124,9 @@ DBG_Process* DBG_Process_AttachNew(const char* executable, const char* args, con
 DBG_Process* DBG_Process_AttachPID(DBG_PID pid);
 
 // Waits or continues after supported debug events
-DBG_Event DBG_Process_DebugWait(DBG_Process* proc);
-void      DBG_Process_DebugContinue(DBG_Event* event);
+DBG_Event DBG_Begin(DBG_Process* proc);
+DBG_Event DBG_Continue(DBG_Event event, DBG_Process* proc);
+DBG_Event DBG_StepInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* thread);
 
 // Manipulate the debuggable process instance
 bool DBG_Process_Detach(DBG_Process* proc);
@@ -148,10 +146,6 @@ bool               DBG_Process_DisableBP(DBG_Process* proc, DBG_Breakpoint* brea
 bool               DBG_Process_EnableBP(DBG_Process* proc, DBG_Breakpoint* breakpoint);
 bool               DBG_Process_DeleteBP(DBG_Process* proc, DBG_Breakpoint* breakpoint);
 DBG_BreakpointInfo DBG_Process_QueryBP(DBG_Process* proc, DBG_Breakpoint* breakpoint);
-
-// Required before/after register operations
-bool DBG_Thread_GetContext(DBG_Thread* thread);
-bool DBG_Thread_SetContext(DBG_Thread* thread);
 
 // Enables the read/write of a thread's registers
 // Getting a register that isn't supported by the host CPU returns 0

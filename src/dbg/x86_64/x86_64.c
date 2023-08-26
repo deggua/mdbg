@@ -6,13 +6,13 @@
 #include "dbg/dbg.h"
 
 static const char* REGISTER_NAMES[] = {
-#define X(_name, ...) [REG_##_name] = #_name,
+#define X(_name, ...) [DBG_Register_##_name] = #_name,
 #include "regs/all.inc"
 #undef X
 };
 
 static const DBG_RegisterType REGISTER_TYPES[] = {
-#define X(_name, _width, _type) [REG_##_name] = DBG_RegisterType_##_type##_width,
+#define X(_name, _width, _type) [DBG_Register_##_name] = DBG_RegisterType_##_type##_width,
 #include "regs/all.inc"
 #undef X
 };

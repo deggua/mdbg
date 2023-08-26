@@ -34,8 +34,6 @@
 #    define BP_EXIT() exit(EXIT_FAILURE)
 #endif
 
-// TODO: check what this does in GDB, if it doesn't trigger a breakpoint at the abort call, use int3
-// or equiv
 #define ABORT(msg, ...)               \
     do {                              \
         fprintf(                      \
