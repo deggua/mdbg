@@ -884,11 +884,66 @@ static CommandResult Command_Help(const String cmd)
     };
 }
 
+static DBG_Event NextInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* thread)
+{
+    DBG_RegisterValue rip      = DBG_Thread_ReadRegister(thread, DBG_Register_RIP);
+    u64               rip_addr = rip.U64.rw_val;
+
+    u8 instr_mem[DBG_MAX_INSTRUCTION_LEN];
+    DBG_Process_ReadMemory(proc, rip_addr, instr_mem, sizeof(instr_mem));
+
+    ZydisDisassembledInstruction instr;
+    ZydisDisassembleIntel(
+        ZYDIS_MACHINE_MODE_LONG_64,
+        rip_addr,
+        instr_mem,
+        sizeof(instr_mem),
+        &instr);
+
+    if (instr.info.meta.category != ZYDIS_CATEGORY_CALL) {
+        return DBG_StepInstruction(event, proc, thread);
+    } else {
+        // set breakpoint after call instruction and continue
+        DBG_Breakpoint* tmp_bp   = DBG_Process_SetBP(proc, rip_addr + instr.info.length);
+        DBG_Event       bp_event = DBG_Continue(event, proc);
+        DBG_Process_DeleteBP(proc, tmp_bp);
+        bp_event.breakpoint = NULL;
+        return bp_event;
+    }
+}
+
 static CommandResult Command_NextInstruction(const String cmd)
 {
-    DBG.e               = DBG_NextInstruction(DBG.e, DBG.proc, DBG.selected_thread);
+    (void)cmd;
+
+    DBG.e               = NextInstruction(DBG.e, DBG.proc, DBG.selected_thread);
     DBG.selected_thread = DBG.e.thread;
     DBG.proc            = DBG.e.process;
+
+    return (CommandResult){
+        .output = String(""),
+        .status = CommandStatus_SUCCESS,
+    };
+}
+
+static CommandResult Command_NextInstruction_K(const String cmd)
+{
+    size_t count  = 1;
+    int    parsed = String_CScan(cmd, "ni %zu", &count);
+    if (parsed != 1) {
+        return (CommandResult){
+            .output = String("Invalid instruction count\n"),
+            .status = CommandStatus_FAILURE,
+        };
+    }
+
+    for (size_t ii = 0; ii < count; ii++) {
+        DBG_Event event = NextInstruction(DBG.e, DBG.proc, DBG.selected_thread);
+
+        DBG.e               = event;
+        DBG.proc            = DBG.e.process;
+        DBG.selected_thread = DBG.e.thread;
+    }
 
     return (CommandResult){
         .output = String(""),
@@ -908,17 +963,18 @@ static CommandResult RunCommand(const String cmd)
         const String expr;
         CommandResult (*handler)(const String cmd);
     } cmd_table[] = {
-        { CommandMatch_EXACT,     str("q"),             Command_Quit},
-        { CommandMatch_EXACT,     str("c"),         Command_Continue},
-        { CommandMatch_EXACT, str("clear"),            Command_Clear},
-        { CommandMatch_EXACT,    str("si"),  Command_StepInstruction},
-        { CommandMatch_EXACT,  str("help"),             Command_Help},
-        { CommandMatch_EXACT,    str("ni"),  Command_NextInstruction},
-        {CommandMatch_PREFIX,    str("b "),    Command_SetBreakpoint},
-        {CommandMatch_PREFIX,  str("del "), Command_DeleteBreakpoint},
-        {CommandMatch_PREFIX,     str("x"),    Command_ExamineMemory},
-        {CommandMatch_PREFIX,  str("set "),      Command_SetRegister},
-        {CommandMatch_PREFIX,   str("si "),  Command_StepInstruction},
+        { CommandMatch_EXACT,     str("q"),              Command_Quit},
+        { CommandMatch_EXACT,     str("c"),          Command_Continue},
+        { CommandMatch_EXACT, str("clear"),             Command_Clear},
+        { CommandMatch_EXACT,    str("si"),   Command_StepInstruction},
+        { CommandMatch_EXACT,  str("help"),              Command_Help},
+        { CommandMatch_EXACT,    str("ni"),   Command_NextInstruction},
+        {CommandMatch_PREFIX,    str("b "),     Command_SetBreakpoint},
+        {CommandMatch_PREFIX,  str("del "),  Command_DeleteBreakpoint},
+        {CommandMatch_PREFIX,     str("x"),     Command_ExamineMemory},
+        {CommandMatch_PREFIX,  str("set "),       Command_SetRegister},
+        {CommandMatch_PREFIX,   str("si "),   Command_StepInstruction},
+        {CommandMatch_PREFIX,   str("ni "), Command_NextInstruction_K},
     };
 
     for (size_t ii = 0; ii < lengthof(cmd_table); ii++) {

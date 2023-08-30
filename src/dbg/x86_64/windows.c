@@ -379,34 +379,6 @@ DBG_Event DBG_StepInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* th
     return step_event;
 }
 
-DBG_Event DBG_NextInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* thread)
-{
-    DBG_RegisterValue rip      = DBG_Thread_ReadRegister(thread, DBG_Register_RIP);
-    u64               rip_addr = rip.U64.rw_val;
-
-    u8 instr_mem[DBG_MAX_INSTRUCTION_LEN];
-    DBG_Process_ReadMemory(proc, rip_addr, instr_mem, sizeof(instr_mem));
-
-    ZydisDisassembledInstruction instr;
-    ZydisDisassembleIntel(
-        ZYDIS_MACHINE_MODE_LONG_64,
-        rip_addr,
-        instr_mem,
-        sizeof(instr_mem),
-        &instr);
-
-    if (instr.info.meta.category != ZYDIS_CATEGORY_CALL) {
-        return DBG_StepInstruction(event, proc, thread);
-    } else {
-        // set breakpoint after call instruction and continue
-        DBG_Breakpoint* tmp_bp   = DBG_Process_SetBP(proc, rip_addr + instr.info.length);
-        DBG_Event       bp_event = DBG_Continue(event, proc);
-        DBG_Process_DeleteBP(proc, tmp_bp);
-        bp_event.breakpoint = NULL;
-        return bp_event;
-    }
-}
-
 bool DBG_HasCpuFeature(DBG_CpuFeature feature)
 {
     DWORD64 features = GetEnabledXStateFeatures();

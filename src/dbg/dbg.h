@@ -127,7 +127,6 @@ DBG_Process* DBG_Process_AttachPID(DBG_PID pid);
 DBG_Event DBG_Begin(DBG_Process* proc);
 DBG_Event DBG_Continue(DBG_Event event, DBG_Process* proc);
 DBG_Event DBG_StepInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* thread);
-DBG_Event DBG_NextInstruction(DBG_Event event, DBG_Process* proc, DBG_Thread* thread);
 
 // Manipulate the debuggable process instance
 bool DBG_Process_Detach(DBG_Process* proc);
@@ -166,11 +165,6 @@ bool             DBG_HasCpuFeature(DBG_CpuFeature feature);
 
 // TODO: not sure about these
 #if 0
-// TODO: API for si/ni, shouldn't necessarily set a breakpoint
-// but should have some way to tell if an instruction is a call instruction or not
-// and get the next instruction to set a BP at
-DBG_Address DBG_NextInstruction(DBG_Thread* thread);
-
 // TODO: no idea how to implement this
 // DBG_SetWatchpoint()
 
